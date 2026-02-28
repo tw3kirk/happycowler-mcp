@@ -77,7 +77,10 @@ class HappyCowler(object):
         self.total_entries = 0
 
     def _parse_results_page(self, url, page_no='', deep_crawl=True):
-        parsed_html = get_parsed_html(url + page_no)
+        if isinstance(url, str):
+            parsed_html = get_parsed_html(url + page_no)
+        else:
+            parsed_html = url  # pre-parsed BeautifulSoup (used in tests)
         if self.total_entries == 0:
             h1 = parsed_html.body.find('h1').text.strip()
             self.total_entries = int(h1[h1.index("(")+1:h1.index(")")])

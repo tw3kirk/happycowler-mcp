@@ -22,9 +22,15 @@ setup(
          'Development Status :: 4 - Beta',
          'Programming Language :: Python'
     ],
+    entry_points={
+        'console_scripts': [
+            'happycowler-mcp=happycowler.mcp_server:main',
+        ],
+    },
     install_requires=[
         "beautifulsoup4 >= 4",
-        "incapsula-cracker-py3"
+        "incapsula-cracker-py3",
+        "mcp >= 1.0",
     ],
     test_suite="tests"
 )
