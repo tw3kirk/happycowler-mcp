@@ -1,69 +1,267 @@
 # -*- coding: utf-8 -*-
 """
-Created on Sat Sep 24 18:02:47 2016
+Crawler and parser for HappyCow.net.
 
-@author: pwittek
+Originally created 2016 by Peter Wittek. Rewritten in 2026 after HappyCow
+migrated to a JavaScript-rendered front end: the old city listing pages no
+longer server-render their venue cards, so the previous class-name scraping
+(``div.row.venue-list-item`` etc.) broke. The current approach is:
+
+  1. Fetch the city listing page only to read the map seed coordinates.
+  2. Page through HappyCow's own JSON endpoint
+     ``/ajax/views/searchmap/venues`` to collect every venue (name, URL, type,
+     coordinates) in a handful of requests.
+  3. Optionally "deep crawl" each venue's review page, reading the stable
+     schema.org microdata (ratingValue, address, telephone, description) plus
+     the opening-hours summary.
 """
 from __future__ import division, print_function
-try:
-    from urllib2 import Request, urlopen
-except ImportError:
-    from urllib.request import Request, urlopen
+
+import re
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 from bs4 import BeautifulSoup
-from incapsula import IncapSession
+
+# HappyCow sits behind Imperva/Incapsula, which fingerprints the TLS handshake
+# (JA3) and serves a bot challenge to plain urllib3/requests clients. curl_cffi
+# impersonates a real browser's TLS stack and sails through it; requests is kept
+# only as a last-resort fallback (it will usually get challenged).
+try:
+    from curl_cffi import requests as _http
+    from curl_cffi.requests.exceptions import RequestException as _RequestException
+    _IMPERSONATE = "chrome"
+except ImportError:  # pragma: no cover - fallback path
+    import requests as _http
+    from requests.exceptions import RequestException as _RequestException
+    _IMPERSONATE = None
+
+RequestException = _RequestException
+
 from .file_io import append_results_to_file, write_footer, write_header
+
+BASE_URL = "https://www.happycow.net"
+LISTING_ENDPOINT = BASE_URL + "/ajax/views/searchmap/venues"
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+# The city page embeds map links such as ``/searchmap?lat=-12.06&lng=-77.03``.
+# Ampersands may be HTML-escaped (``&amp;``) in the served markup.
+_LATLNG_RE = re.compile(r"lat=(-?\d+(?:\.\d+)?)&(?:amp;)?lng=(-?\d+(?:\.\d+)?)")
+
+# HappyCow's data-type / category-label values that map onto the classic
+# Vegan / Vegetarian / Veg-friendly buckets the MCP type_filter understands.
+_RESTAURANT_TYPE = {
+    "vegan": "Vegan",
+    "vegetarian": "Vegetarian",
+    "veg-options": "Veg-friendly",
+    "veg options": "Veg-friendly",
+    "veg-friendly": "Veg-friendly",
+}
+
+
+class HappyCowError(Exception):
+    """Raised when HappyCow cannot be crawled: bad URL, blocked, or the page
+    structure changed so the expected data could not be located."""
 
 
 def normalize(text):
-    processed_text = text.replace("&", "&amp;")
+    """Escape ampersands (so downstream XML/KML/GPX output is valid) and strip."""
+    processed_text = (text or "").replace("&", "&amp;")
     if sys.version_info.major == 3:
         return processed_text.strip()
-    else:
-        return processed_text.encode("utf-8").strip()
+    return processed_text.encode("utf-8").strip()
 
 
-def get_parsed_html(url):
-    session = IncapSession(user_agent='Mozilla/5.0')
-    response = session.get(url)
-    page = response.content
-    return BeautifulSoup(page, "html.parser")
+def _new_session(user_agent=DEFAULT_USER_AGENT):
+    kwargs = {"impersonate": _IMPERSONATE} if _IMPERSONATE else {}
+    session = _http.Session(**kwargs)
+    session.headers.update({
+        "User-Agent": user_agent,
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    return session
 
 
-def parse_restaurant_page(restaurant_page):
-    gmap_link = restaurant_page.find("div", class_="box__map__links").find('a')
-    text_link = gmap_link.attrs["href"]
-    start = text_link.find('q=loc:') + 6
-    lat, lon = text_link[start:].split('+')
-    return (lat, lon)
+def _http_get(session, url, xhr=False, as_json=False, timeout=30):
+    headers = {}
+    if xhr:
+        headers["X-Requested-With"] = "XMLHttpRequest"
+    if as_json:
+        headers["Accept"] = "application/json, text/javascript, */*; q=0.01"
+    response = session.get(url, headers=headers, timeout=timeout)
+    if response.status_code == 404:
+        raise HappyCowError(
+            "HappyCow returned 404 for {}. Check the city URL: region slugs use "
+            "underscores (e.g. 'south_america', 'north_america'), not hyphens."
+            .format(url)
+        )
+    response.raise_for_status()
+    if as_json:
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise HappyCowError(
+                "Expected JSON from {} but the response was not JSON: {}"
+                .format(url, exc)
+            )
+    return response.text
+
+
+def get_parsed_html(url, session=None):
+    """Fetch ``url`` and return a parsed BeautifulSoup document."""
+    session = session or _new_session()
+    return BeautifulSoup(_http_get(session, url), "html.parser")
+
+
+def extract_latlng(city_html):
+    """Pull the (lat, lng) the city listing page uses to seed its map search."""
+    match = _LATLNG_RE.search(city_html)
+    if not match:
+        raise HappyCowError(
+            "Could not find map coordinates on the city page. HappyCow's page "
+            "structure may have changed, or this is not a valid city listing URL."
+        )
+    return match.group(1), match.group(2)
+
+
+def classify_type(data_type, vegan="0", vegonly="0"):
+    """Map HappyCow's ``data-type`` (+ vegan flags) to a human-readable tag.
+
+    Restaurants collapse to the classic Vegan / Vegetarian / Veg-friendly
+    buckets. Other categories (stores, delivery, catering, coffee & tea, ...)
+    keep their label, prefixed with the venue's vegan status so a "Vegan"
+    filter still matches a fully-vegan store or delivery kitchen.
+    """
+    dt = (data_type or "").strip()
+    key = dt.lower()
+    if key in _RESTAURANT_TYPE:
+        return _RESTAURANT_TYPE[key]
+    label = dt or "Other"
+    if vegan == "1" and vegonly == "1":
+        return "Vegan " + label
+    if vegan == "1":
+        return "Vegetarian " + label
+    return label
+
+
+def parse_listing_fragment(fragment_html):
+    """Parse the HTML fragment returned by the ``/ajax/.../venues`` endpoint.
+
+    Returns a list of dicts with keys: name, url, tag, coordinates.
+    """
+    soup = BeautifulSoup(fragment_html or "", "html.parser")
+    venues = []
+    for card in soup.select("div.card-listing.venue-item"):
+        link = card.find(
+            "a", href=lambda h: h and h.startswith("/reviews/") and "#" not in h
+        )
+        if link is None:
+            continue
+        heading = card.find(["h4", "h3", "h2"])
+        name = heading.get_text(strip=True) if heading else link.get("title", "").strip()
+        details = card.select_one(".details")
+        if details is not None:
+            data_type = details.get("data-type", "")
+            vegan = details.get("data-vegan", "0")
+            vegonly = details.get("data-vegonly", "0")
+            coords = (details.get("data-lat", ""), details.get("data-lng", ""))
+        else:
+            data_type, vegan, vegonly, coords = "", "0", "0", ("", "")
+        venues.append({
+            "name": name,
+            "url": BASE_URL + link["href"],
+            "tag": classify_type(data_type, vegan, vegonly),
+            "coordinates": coords,
+        })
+    return venues
+
+
+def _microdata(soup, prop):
+    """Read a schema.org microdata value: prefer the ``content`` attribute,
+    else the element text. Returns '' when the property is absent."""
+    el = soup.find(attrs={"itemprop": prop})
+    if el is None:
+        return ""
+    return (el.get("content") or el.get_text(" ", strip=True)).strip()
+
+
+def parse_venue_detail(review_html):
+    """Parse a venue review page. Returns a dict with keys:
+    rating, address, phone, hours, cuisine, description."""
+    soup = BeautifulSoup(review_html, "html.parser")
+
+    rating_value = _microdata(soup, "ratingValue")
+    try:
+        rating = "{:.1f}".format(float(rating_value)) if rating_value else "unknown"
+    except ValueError:
+        rating = "unknown"
+
+    # Prefer composing a clean address from its parts; fall back to the blob.
+    parts = [_microdata(soup, p)
+             for p in ("streetAddress", "addressLocality", "addressCountry")]
+    address = ", ".join(p for p in parts if p) or _microdata(soup, "address")
+
+    hours = ""
+    hours_el = soup.select_one(".hours-summary")
+    if hours_el:
+        hours = re.sub(r"^Open\s+", "", hours_el.get_text(" ", strip=True)).rstrip(".")
+
+    return {
+        "rating": rating,
+        "address": address,
+        "phone": _microdata(soup, "telephone"),
+        "hours": hours,
+        # HappyCow no longer exposes a discrete cuisine field on listings.
+        "cuisine": "",
+        "description": _microdata(soup, "description"),
+    }
+
+
+_EMPTY_DETAIL = {
+    "rating": "unknown", "address": "", "phone": "",
+    "hours": "", "cuisine": "", "description": "",
+}
 
 
 class HappyCowler(object):
+    """Crawl the HappyCow database for a city.
 
-    """Class for crawling the HappyCow database
-
-    :param city_url: The URL string(s) for the main page of the city to be
-                     crawled.
-    :type city_url: str or list of str
-    :param target_file: Optional parameter to write the results to a target
-                        file.
-    :type target_file: str.
-
-    :param verbose: Optional parameter for level of verbosity:
-
-                       * 0: quiet (default)
-                       * 1: verbose
-    :type verbose: int.
+    :param city_url: HappyCow city listing URL, or a list of them, e.g.
+                     ``https://www.happycow.net/south_america/peru/lima/``.
+    :param target_file: Optional ``.kml`` / ``.gpx`` file to write results to.
+    :param verbose: 0 quiet (default), 1 progress to stdout.
+    :param type_filter: Optional 'vegan' / 'vegetarian' / 'veg-friendly' to
+                        collect only matching venues (cheaper: fewer deep
+                        crawls). ``None`` / 'all' collects everything.
+    :param max_results: Cap the number of venues per city (bounds deep crawls).
+    :param deep_crawl: When True (default) fetch each venue's review page to
+                       fill rating/address/phone/hours/description.
+    :param max_pages: Safety cap on listing-endpoint pagination.
+    :param workers: Thread pool size for concurrent deep crawls.
+    :param request_delay: Optional politeness delay (seconds) between listing
+                          pages.
+    :param session: Optional pre-built ``requests.Session``.
     """
-    def __init__(self, city_url, target_file=None, verbose=0):
-        """Constructor for the class.
-        """
-        if isinstance(city_url, list):
-            self.city_url = city_url
-        else:
-            self.city_url = [city_url]
+
+    def __init__(self, city_url, target_file=None, verbose=0, type_filter=None,
+                 max_results=None, deep_crawl=True, max_pages=25, workers=8,
+                 request_delay=0.0, session=None):
+        self.city_url = city_url if isinstance(city_url, list) else [city_url]
         self.target_file = target_file
         self.verbose = verbose
+        self.type_filter = self._normalize_filter(type_filter)
+        self.max_results = max_results
+        self.deep_crawl = deep_crawl
+        self.max_pages = max_pages
+        self.workers = max(1, workers)
+        self.request_delay = request_delay
+        self.session = session or _new_session()
+
+        # Public result columns (kept for backwards compatibility).
         self.coordinates = []
         self.names = []
         self.tags = []
@@ -73,133 +271,99 @@ class HappyCowler(object):
         self.opening_hours = []
         self.cuisines = []
         self.descriptions = []
-        self.processed_entries = 0
         self.total_entries = 0
+        self.processed_entries = 0
 
-    def _parse_results_page(self, url, page_no='', deep_crawl=True):
-        if isinstance(url, str):
-            parsed_html = get_parsed_html(url + page_no)
+    @staticmethod
+    def _normalize_filter(type_filter):
+        if not type_filter:
+            return None
+        return {
+            "vegan": "Vegan",
+            "vegetarian": "Vegetarian",
+            "veg-friendly": "Veg-friendly",
+        }.get(type_filter.lower())
+
+    def _collect_listings(self, city_url):
+        city_html = _http_get(self.session, city_url)
+        lat, lng = extract_latlng(city_html)
+        collected, seen = [], set()
+        for page in range(1, self.max_pages + 1):
+            url = "{}?lat={}&lng={}&page={}&s=3".format(
+                LISTING_ENDPOINT, lat, lng, page)
+            payload = _http_get(self.session, url, xhr=True, as_json=True)
+            fragment = payload.get("data", "") if isinstance(payload, dict) else ""
+            new = [v for v in parse_listing_fragment(fragment) if v["url"] not in seen]
+            if not new:
+                break  # last page reached
+            for v in new:
+                seen.add(v["url"])
+            collected.extend(new)
+            if self.request_delay:
+                time.sleep(self.request_delay)
+        return collected
+
+    def _fetch_detail(self, venue):
+        if not self.deep_crawl:
+            return dict(_EMPTY_DETAIL)
+        try:
+            return parse_venue_detail(_http_get(self.session, venue["url"]))
+        except (HappyCowError, RequestException):
+            return dict(_EMPTY_DETAIL)
+
+    def _store(self, listings):
+        if self.deep_crawl and len(listings) > 1:
+            with ThreadPoolExecutor(max_workers=self.workers) as pool:
+                details = list(pool.map(self._fetch_detail, listings))
         else:
-            parsed_html = url  # pre-parsed BeautifulSoup (used in tests)
-        if self.total_entries == 0:
-            h1 = parsed_html.body.find('h1').text.strip()
-            self.total_entries = int(h1[h1.index("(")+1:h1.index(")")])
-        coordinates = []
-        names = []
-        tags = []
-        ratings = []
-        addresses = []
-        phone_numbers = []
-        opening_hours = []
-        cuisines = []
-        descriptions = []
-        for business in parsed_html.body.findAll('div',
-                                                 class_="row venue-list-item"):
-            self.processed_entries += 1
-            restaurant_url = 'https://www.happycow.net' + \
-                business.find('a').get('href')
-            if deep_crawl:
-                coordinates.append(parse_restaurant_page(
-                    get_parsed_html(restaurant_url)))
-            else:
-                coordinates.append(('', ''))
-            name = normalize(business.find('a').text)
-            if self.verbose > 0:
-                percentage = " (done: {:.2%}".format(self.processed_entries /
-                                                     self.total_entries)
-                msg = "\r\x1b[KCurrent entry: " + name + percentage + ")"
-                sys.stdout.write(msg)
-                sys.stdout.flush()
+            details = [self._fetch_detail(v) for v in listings]
 
-            names.append(name)
-            tags.append(normalize(business.find('span').text))
-            stars = business.find('ul', class_="venue-ratings list-inline")
-            if stars is None:
-                rating = "unknown"
-            else:
-                rating = str(len(stars.findAll("i", class_="fa fa-star")) + 0.5*
-                             len(stars.findAll("i", class_="fa fa-star-half-o")))
-            ratings.append(rating)
-            address = None
-            for p in business.findAll('p'):
-                if p.find('i', class_="fa fa-map-marker"):
-                    address = p.text
-            if address is not None:
-                addresses.append(normalize(address))
-            else:
-                addresses.append('')
-            phone_number = None
-            for p in business.findAll('p'):
-                if p.find('i', class_="fa fa-phone"):
-                    phone_number = p.text
-            if phone_number is not None:
-                phone_numbers.append(normalize(phone_number))
-            else:
-                phone_numbers.append('')
-            opening_hour = business.find('span', class_='venue-hours-container')
-            if opening_hour is not None:
-                opening_hours.append(normalize(opening_hour.attrs['data-summary']))
-            else:
-                opening_hours.append('')
-            cuisine = None
-            for p in business.findAll('p'):
-                if "uisine" in p.text:
-                    cuisine = p.text
-            if cuisine is not None:
-                cuisines.append(normalize(cuisine))
-            else:
-                cuisines.append('')
-            divs = business.findAll("div", class_="col-xs-12")
-            description = divs[-1].find('p').text
-            if description is not None:
-                descriptions.append(normalize(description))
-            else:
-                description.append('')
+        coordinates, names, tags, ratings = [], [], [], []
+        addresses, phones, hours, cuisines, descriptions = [], [], [], [], []
+        for venue, detail in zip(listings, details):
+            self.processed_entries += 1
+            if self.verbose:
+                sys.stdout.write("\r\x1b[KProcessed: " + venue["name"])
+                sys.stdout.flush()
+            coordinates.append(venue["coordinates"])
+            names.append(normalize(venue["name"]))
+            tags.append(normalize(venue["tag"]))
+            ratings.append(detail["rating"])
+            addresses.append(normalize(detail["address"]))
+            phones.append(normalize(detail["phone"]))
+            hours.append(normalize(detail["hours"]))
+            cuisines.append(normalize(detail["cuisine"]))
+            descriptions.append(normalize(detail["description"]))
+        if self.verbose:
+            sys.stdout.write("\n")
+
         if self.target_file is not None:
             append_results_to_file(self.target_file, coordinates, names, tags,
-                                   ratings, addresses, phone_numbers,
-                                   opening_hours, cuisines,
+                                   ratings, addresses, phones, hours, cuisines,
                                    descriptions)
         self.coordinates += coordinates
         self.names += names
         self.tags += tags
         self.ratings += ratings
         self.addresses += addresses
-        self.phone_numbers += phone_numbers
-        self.opening_hours += opening_hours
+        self.phone_numbers += phones
+        self.opening_hours += hours
         self.cuisines += cuisines
         self.descriptions += descriptions
-        pagination = parsed_html.body.find('ul', class_="pagination")
-        last = False
-        if pagination is not None:
-            for a in pagination.findAll('a'):
-                if 'aria-label' in a.attrs and a.attrs['aria-label'] == "Next":
-                    new_page_no = a.attrs['href']
-                    new_page_no = new_page_no[new_page_no.index("?page"):]
-                    if page_no != new_page_no:
-                        self._parse_results_page(url, new_page_no)
-                    else:
-                        last = True
-                    break
-            if last and self.verbose > 0:
-                sys.stdout.write("\n")
-        else:
-            if self.verbose > 0:
-                sys.stdout.write("\n")
-
-    def _estimate_number_of_restaurants(self):
-        self.total_entries = 0
 
     def crawl(self):
-        """Process the results page.
-        """
+        """Crawl every configured city and populate the result columns."""
         if self.target_file is not None:
             write_header(self.target_file)
-        for url in self.city_url:
-            if self.verbose > 0:
-                print(url)
-            self._parse_results_page(url)
-        if self.verbose > 0:
-            sys.stdout.write("\r")
+        for city_url in self.city_url:
+            if self.verbose:
+                print(city_url)
+            listings = self._collect_listings(city_url)
+            if self.type_filter:
+                listings = [v for v in listings if self.type_filter in v["tag"]]
+            self.total_entries += len(listings)
+            if self.max_results is not None:
+                listings = listings[:self.max_results]
+            self._store(listings)
         if self.target_file is not None:
             write_footer(self.target_file)

@@ -37,16 +37,13 @@ git clone https://github.com/tw3kirk/happycowler-mcp.git
 cd happycowler-mcp
 
 # 2. Install Python dependencies
-pip install beautifulsoup4 "mcp>=1.0"
-
-# 3. Install the incapsula library manually (required for HappyCow access)
-pip install requests six bs4
-# Then copy the incapsula package into your site-packages:
-pip download incapsula-cracker-py3 -d /tmp/incap && \
-  tar xzf /tmp/incap/incapsula-cracker-py3-*.tar.gz -C /tmp/incap && \
-  cp -r /tmp/incap/incapsula-cracker-py3-*/incapsula \
-        $(python -c "import site; print(site.getsitepackages()[0])")
+pip install beautifulsoup4 "curl_cffi>=0.7" "mcp>=1.0"
 ```
+
+> **Why `curl_cffi`?** HappyCow sits behind Imperva/Incapsula, which fingerprints
+> the TLS handshake and blocks plain `requests`/`urllib`. `curl_cffi` impersonates
+> a real browser's TLS stack, so requests get through. (This replaces the old,
+> now-defunct `incapsula-cracker-py3` dependency.)
 
 > **Tip:** Note the absolute path to your `server.py` — you'll need it in the config steps below.
 >
@@ -162,8 +159,8 @@ claude mcp remove happycowler
 ## How It Works
 
 1. You ask Claude a natural language question about vegan/vegetarian restaurants.
-2. Claude constructs the correct HappyCow city URL (e.g. `https://www.happycow.net/south-america/peru/lima/`) and calls the `search_restaurants` tool.
-3. The tool crawls the HappyCow listing page and returns structured JSON — name, type, rating, address, phone, hours, cuisine, and description for each restaurant.
+2. Claude constructs the correct HappyCow city URL (e.g. `https://www.happycow.net/south_america/peru/lima/`) and calls the `search_restaurants` tool.
+3. The tool reads the city's map coordinates, pages through HappyCow's JSON venue endpoint, and (by default) reads each venue's review page for details — returning structured JSON with name, type, rating, address, phone, hours, cuisine, and description for each restaurant.
 4. Claude presents the results in whatever format you asked for.
 
 ### HappyCow URL pattern
@@ -174,14 +171,14 @@ The tool accepts any HappyCow city listing URL. The format is:
 https://www.happycow.net/{region}/{country}/{city}/
 ```
 
-Common regions: `europe`, `north-america`, `south-america`, `asia`, `africa`, `oceania`, `middle-east`
+Common regions (multi-word regions use an **underscore**, not a hyphen — a hyphen returns HTTP 404): `europe`, `north_america`, `south_america`, `asia`, `africa`, `oceania`, `middle_east`
 
 | City | URL |
 |------|-----|
-| Lima, Peru | `https://www.happycow.net/south-america/peru/lima/` |
+| Lima, Peru | `https://www.happycow.net/south_america/peru/lima/` |
 | Tokyo, Japan | `https://www.happycow.net/asia/japan/tokyo/` |
 | Berlin, Germany | `https://www.happycow.net/europe/germany/berlin/` |
-| New York, USA | `https://www.happycow.net/north-america/usa/new-york/` |
+| New York, USA | `https://www.happycow.net/north_america/usa/new-york/` |
 | London, UK | `https://www.happycow.net/europe/england/london/` |
 | Sydney, Australia | `https://www.happycow.net/oceania/australia/sydney/` |
 

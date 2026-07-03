@@ -31,18 +31,19 @@ def search_restaurants(
     HappyCow URL format:
         https://www.happycow.net/{region}/{country}/{city}/
 
-    Common region slugs:
-        europe, north-america, south-america, asia, africa, oceania, middle-east
+    Common region slugs (note: multi-word regions use an UNDERSCORE, not a
+    hyphen — e.g. south_america; a hyphen returns HTTP 404):
+        europe, north_america, south_america, asia, africa, oceania, middle_east
 
     URL examples:
-        Lima, Peru        -> https://www.happycow.net/south-america/peru/lima/
+        Lima, Peru        -> https://www.happycow.net/south_america/peru/lima/
         Tokyo, Japan      -> https://www.happycow.net/asia/japan/tokyo/
         Berlin, Germany   -> https://www.happycow.net/europe/germany/berlin/
-        New York, USA     -> https://www.happycow.net/north-america/usa/new-york/
+        New York, USA     -> https://www.happycow.net/north_america/usa/new-york/
         London, UK        -> https://www.happycow.net/europe/england/london/
         Sydney, Australia -> https://www.happycow.net/oceania/australia/sydney/
         Bangkok, Thailand -> https://www.happycow.net/asia/thailand/bangkok/
-        Mexico City       -> https://www.happycow.net/north-america/mexico/mexico-city/
+        Mexico City       -> https://www.happycow.net/north_america/mexico/mexico-city/
 
     Args:
         city_url: Full HappyCow URL for the city listing page.
@@ -67,7 +68,8 @@ def search_restaurants(
         On error returns: {"error": "<message>"}
     """
     try:
-        hc = HappyCowler(city_url)
+        # Pass the filter/cap down so we only deep-crawl venues we'll return.
+        hc = HappyCowler(city_url, type_filter=type_filter, max_results=max_results)
         hc.crawl()
     except Exception as exc:
         return json.dumps({"error": str(exc)})

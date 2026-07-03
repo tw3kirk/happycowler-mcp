@@ -5,7 +5,7 @@ except ImportError:
 
 setup(
     name='happycowler',
-    version='0.2.4',
+    version='0.3.0',
     author='Peter Wittek',
     author_email='peterwittek@users.noreply.github.com',
     packages=['happycowler'],
@@ -29,7 +29,9 @@ setup(
     },
     install_requires=[
         "beautifulsoup4 >= 4",
-        "incapsula-cracker-py3",
+        # curl_cffi impersonates a browser's TLS fingerprint, which is required
+        # to get past HappyCow's Imperva/Incapsula bot protection.
+        "curl_cffi >= 0.7",
         "mcp >= 1.0",
     ],
     test_suite="tests"

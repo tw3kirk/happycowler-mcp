@@ -7,14 +7,14 @@ There are three test suites here:
   TestMCPSearchRestaurants   – unit tests; mock HappyCowler so no HTTP is
                                needed.  These always run.
 
-  TestParsingWithWormsFixture – unit tests; exercise the real parser against
-                               the 2017-era Worms, Germany HTML fixture that
-                               ships with the repo.  Always run.
+  TestCrawlPipelineWithFixtures – unit tests; drive the full HappyCowler.crawl()
+                               pipeline with HTTP mocked, against captured
+                               HappyCow fixtures.  Always run.
 
   TestLiveHappyCow           – integration tests that hit happycow.net over
                                the network.  Skipped by default.  Enable with:
 
-                                   HAPPYCOW_RUN_LIVE_TESTS=1 python -m pytest tests/ -v
+                                   HAPPYCOW_RUN_LIVE_TESTS=1 python -m unittest discover -s tests
 
                                These are the definitive "does it work with the
                                current site?" check.
@@ -23,8 +23,6 @@ import json
 import os
 import unittest
 from unittest.mock import MagicMock, patch
-
-from bs4 import BeautifulSoup
 
 from happycowler import HappyCowler
 from happycowler.mcp_server import search_restaurants
@@ -239,77 +237,76 @@ class TestMCPSearchRestaurants(unittest.TestCase):
 _DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_pages/")
 
 
-class TestParsingWithWormsFixture(unittest.TestCase):
-    """Verify every field the parser extracts from the bundled 2017 fixture.
+class TestCrawlPipelineWithFixtures(unittest.TestCase):
+    """Exercise the full HappyCowler.crawl() pipeline against captured HappyCow
+    fixtures, with all HTTP mocked. This is the regression baseline: if the
+    listing-fragment or review-page parsers break, these tests catch it.
 
-    This gives us a regression baseline: if any selector breaks (e.g. because
-    we upgrade BeautifulSoup or refactor the parser) these tests will catch it.
+    The mock reproduces HappyCow's three request stages:
+      1. city listing page   -> HTML containing the map seed lat/lng
+      2. /ajax/.../venues     -> JSON {"data": <listing fragment>}
+      3. /reviews/<slug>      -> venue detail page (schema.org microdata)
     """
 
     @classmethod
     def setUpClass(cls):
-        path = _DATA_PATH + "Vegan & Vegetarian Restaurants in Worms, Germany.htm"
-        with open(path, "r") as f:
-            text = f.read()
-        parsed = BeautifulSoup(text, "html.parser")
-        cls.hc = HappyCowler("")
-        cls.hc._parse_results_page(parsed, page_no="", deep_crawl=False)
+        with open(_DATA_PATH + "lima_listing_fragment.html") as f:
+            cls.fragment = f.read()
+        with open(_DATA_PATH + "noqa_review_snippet.html") as f:
+            cls.review = f.read()
 
-    def test_total_entries_count(self):
-        self.assertEqual(self.hc.total_entries, 2)
+    def _fake_http_get(self, session, url, xhr=False, as_json=False, timeout=30):
+        if as_json:  # the /ajax/.../venues endpoint
+            # page=1 returns the fragment; any later page returns nothing (stop)
+            data = self.fragment if "page=1&" in url or url.endswith("page=1") else ""
+            return {"data": data, "success": True}
+        if "/reviews/" in url:  # deep-crawl of a venue detail page
+            return self.review
+        # the city listing page: must contain a searchmap lat/lng link
+        return ('<html><body><a href="/searchmap?lat=-12.062106&amp;'
+                'lng=-77.036526">map</a></body></html>')
 
-    def test_restaurant_names(self):
-        self.assertEqual(self.hc.names, ["Frollein Elfriede", "Eis Vannini"])
+    def _crawl(self, **kwargs):
+        with patch("happycowler.happycowler._http_get", side_effect=self._fake_http_get):
+            hc = HappyCowler("https://www.happycow.net/south_america/peru/lima/",
+                             **kwargs)
+            hc.crawl()
+        return hc
 
-    def test_restaurant_tags(self):
-        self.assertEqual(self.hc.tags, ["Catering", "Other"])
+    def test_collects_all_listing_venues(self):
+        hc = self._crawl(deep_crawl=False)
+        self.assertEqual(hc.names[:2], ["Chocotejas Veganas", "Noqa Vegan"])
+        self.assertEqual(len(hc.names), 5)
 
-    def test_ratings_unknown_when_no_stars(self):
-        # Neither fixture restaurant has star ratings
-        self.assertEqual(self.hc.ratings, ["unknown", "unknown"])
+    def test_coordinates_from_listing(self):
+        hc = self._crawl(deep_crawl=False)
+        for lat, lng in hc.coordinates:
+            self.assertTrue(lat and lng)
 
-    def test_addresses(self):
-        self.assertEqual(
-            self.hc.addresses,
-            [
-                "Kleine Wollgasse 7, Worms, Germany",
-                "Am Marktplatz, Neuemarkt Strasse, Worms, Germany",
-            ],
-        )
+    def test_deep_crawl_fills_detail_fields(self):
+        hc = self._crawl()
+        i = hc.names.index("Noqa Vegan")
+        self.assertEqual(hc.ratings[i], "5.0")
+        self.assertEqual(hc.phone_numbers[i], "+51-960550950")
+        self.assertEqual(hc.opening_hours[i], "Mon-Sun 10:00am-6:30pm")
+        self.assertIn("Lima", hc.addresses[i])
 
-    def test_phone_numbers(self):
-        self.assertEqual(self.hc.phone_numbers, ["06241324440", "n/a"])
+    def test_type_filter_limits_to_vegan(self):
+        hc = self._crawl(type_filter="vegan", deep_crawl=False)
+        self.assertTrue(all("Vegan" in t for t in hc.tags))
+        self.assertIn("Noqa Vegan", hc.names)
 
-    def test_opening_hours(self):
-        # Frollein Elfriede: "Call for hours" (data-summary contains an <a> tag)
-        self.assertIn("Call for hours", self.hc.opening_hours[0])
-        # Eis Vannini: concrete hours
-        self.assertEqual(self.hc.opening_hours[1], "Mon-Sun 10:00am-11:00pm")
-
-    def test_descriptions(self):
-        self.assertEqual(
-            self.hc.descriptions,
-            [
-                "Vegan catering service.",
-                "Italian ice cream parlor with several locations. Offers also vegan varieties.",
-            ],
-        )
-
-    def test_coordinates_empty_without_deep_crawl(self):
-        # deep_crawl=False means coordinates should be empty strings
-        for coord in self.hc.coordinates:
-            self.assertEqual(coord, ("", ""))
+    def test_max_results_caps_before_deep_crawl(self):
+        hc = self._crawl(max_results=2, deep_crawl=False)
+        self.assertEqual(len(hc.names), 2)
 
     def test_result_lists_are_equal_length(self):
-        n = len(self.hc.names)
-        self.assertEqual(len(self.hc.tags),          n)
-        self.assertEqual(len(self.hc.ratings),       n)
-        self.assertEqual(len(self.hc.addresses),     n)
-        self.assertEqual(len(self.hc.phone_numbers), n)
-        self.assertEqual(len(self.hc.opening_hours), n)
-        self.assertEqual(len(self.hc.cuisines),      n)
-        self.assertEqual(len(self.hc.descriptions),  n)
-        self.assertEqual(len(self.hc.coordinates),   n)
+        hc = self._crawl()
+        n = len(hc.names)
+        for col in (hc.tags, hc.ratings, hc.addresses, hc.phone_numbers,
+                    hc.opening_hours, hc.cuisines, hc.descriptions,
+                    hc.coordinates):
+            self.assertEqual(len(col), n)
 
 
 # ---------------------------------------------------------------------------
