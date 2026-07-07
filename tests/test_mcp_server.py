@@ -19,12 +19,16 @@ There are three test suites here:
                                These are the definitive "does it work with the
                                current site?" check.
 """
+import glob
 import json
 import os
+import tempfile
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
 from happycowler import HappyCowler
+from happycowler import happycowler as hc_mod
 from happycowler.mcp_server import search_restaurants
 
 # ---------------------------------------------------------------------------
@@ -272,7 +276,8 @@ class TestCrawlPipelineWithFixtures(unittest.TestCase):
                 'lng=-77.036526">map</a></body></html>')
 
     def _crawl(self, **kwargs):
-        with patch("happycowler.happycowler._http_get", side_effect=self._fake_http_get):
+        with patch("happycowler.happycowler._http_get", side_effect=self._fake_http_get), \
+             patch.object(hc_mod, "_CACHE_TTL", 0):  # no disk cache in these tests
             hc = HappyCowler("https://www.happycow.net/south_america/peru/lima/",
                              **kwargs)
             hc.crawl()
@@ -358,7 +363,101 @@ class TestCrawlPipelineWithFixtures(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Suite 3: Live integration tests (skipped unless opt-in)
+# Suite 3: Local disk cache
+# ---------------------------------------------------------------------------
+
+class TestLocalCache(unittest.TestCase):
+    """City crawls and venue details are cached on disk (24h TTL) so repeat
+    queries against the same city cost zero HTTP requests. All HTTP mocked;
+    the cache directory is a per-test tempdir."""
+
+    CITY = "https://www.happycow.net/south_america/peru/lima/"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        for target, value in (("_CACHE_DIR", self.tmp.name),
+                              ("_CACHE_TTL", 24 * 3600.0)):
+            p = patch.object(hc_mod, target, value)
+            p.start()
+            self.addCleanup(p.stop)
+        self.calls = []
+        with open(_DATA_PATH + "lima_listing_fragment.html") as f:
+            self.fragment = f.read()
+        with open(_DATA_PATH + "noqa_review_snippet.html") as f:
+            self.review = f.read()
+
+    def _fake_http_get(self, session, url, xhr=False, as_json=False, timeout=30):
+        self.calls.append(url)
+        if as_json:
+            data = self.fragment if "page=1&" in url else ""
+            return {"data": data, "success": True}
+        if "/reviews/" in url:
+            return self.review
+        return ('<html><body><a href="/searchmap?lat=-12.062106&amp;'
+                'lng=-77.036526">map</a></body></html>')
+
+    def _crawl(self, **kwargs):
+        with patch("happycowler.happycowler._http_get",
+                   side_effect=self._fake_http_get):
+            hc = HappyCowler(self.CITY, **kwargs)
+            hc.crawl()
+        return hc
+
+    def test_second_crawl_makes_no_requests(self):
+        self._crawl(deep_crawl=False)
+        first = len(self.calls)
+        self.assertGreater(first, 0)
+        hc2 = self._crawl(deep_crawl=False)
+        self.assertEqual(len(self.calls), first)  # zero new HTTP requests
+        self.assertEqual(len(hc2.names), 5)
+        self.assertEqual(hc2.names[0], "Chocotejas Veganas")
+
+    def test_cached_listing_supports_sorting_and_filters(self):
+        self._crawl(deep_crawl=False)
+        first = len(self.calls)
+        hc2 = self._crawl(deep_crawl=False, sort_by="distance", radius_miles=5)
+        self.assertEqual(len(self.calls), first)
+        known = [d for d in hc2.distances if d is not None]
+        self.assertEqual(known, sorted(known))
+
+    def test_venue_details_cached_across_instances(self):
+        self._crawl()  # deep crawl fetches + caches every venue page
+        first = len(self.calls)
+        hc2 = self._crawl()
+        self.assertEqual(len(self.calls), first)
+        i = hc2.names.index("Noqa Vegan")
+        self.assertEqual(hc2.reviews[i], "41")
+        self.assertEqual(hc2.phone_numbers[i], "+51-960550950")
+
+    def test_refresh_bypasses_cache(self):
+        self._crawl(deep_crawl=False)
+        first = len(self.calls)
+        self._crawl(deep_crawl=False, refresh=True)
+        self.assertGreater(len(self.calls), first)
+
+    def test_expired_entries_are_refetched(self):
+        self._crawl(deep_crawl=False)
+        for path in glob.glob(os.path.join(self.tmp.name, "*.json")):
+            with open(path) as f:
+                entry = json.load(f)
+            entry["fetched_at"] = time.time() - 25 * 3600
+            with open(path, "w") as f:
+                json.dump(entry, f)
+        first = len(self.calls)
+        self._crawl(deep_crawl=False)
+        self.assertGreater(len(self.calls), first)
+
+    def test_ttl_zero_disables_cache(self):
+        with patch.object(hc_mod, "_CACHE_TTL", 0):
+            self._crawl(deep_crawl=False)
+            first = len(self.calls)
+            self._crawl(deep_crawl=False)
+            self.assertGreater(len(self.calls), first)
+
+
+# ---------------------------------------------------------------------------
+# Suite 4: Live integration tests (skipped unless opt-in)
 # ---------------------------------------------------------------------------
 
 _LIVE = os.getenv("HAPPYCOW_RUN_LIVE_TESTS")

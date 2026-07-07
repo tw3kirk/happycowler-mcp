@@ -1,3 +1,12 @@
+Version 0.5.0: 2026-07-07
+  - New: Local disk cache (default ~/.cache/happycowler, 24h TTL) for city
+    listing crawls and venue detail pages. Repeat queries against the same
+    city cost zero HTTP requests, and different sorts/filters reuse the same
+    cached crawl (they are applied client-side). refresh=True on the MCP
+    tool forces a re-crawl; HAPPYCOW_CACHE_TTL (seconds, 0 disables) and
+    HAPPYCOW_CACHE_DIR override the defaults. Failures and WAF challenge
+    pages are never cached.
+
 Version 0.4.0: 2026-07-07
   - New: sort_by (default | distance | rating | popularity), min_rating, and
     radius_miles parameters on HappyCowler and the search_restaurants MCP

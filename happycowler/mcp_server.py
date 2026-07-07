@@ -25,6 +25,7 @@ def search_restaurants(
     sort_by: str = "default",
     min_rating: float = 0,
     radius_miles: float = 0,
+    refresh: bool = False,
 ) -> str:
     """Search for vegan and vegetarian restaurants on HappyCow.net for a given city.
 
@@ -68,6 +69,11 @@ def search_restaurants(
             (e.g. 4.0). Unrated venues are dropped. 0 disables (default).
         radius_miles: Only return venues within this many miles of the city
             center (e.g. 50). 0 disables (default).
+        refresh: Force a fresh crawl. By default results come from a local
+            cache when the same city was crawled within the last 24 hours
+            (sorts/filters still apply — they run on the cached data).
+            Env overrides: HAPPYCOW_CACHE_TTL seconds (0 disables caching),
+            HAPPYCOW_CACHE_DIR (default ~/.cache/happycowler).
 
     Returns:
         JSON array of restaurant objects. Each object contains:
@@ -90,7 +96,8 @@ def search_restaurants(
         # Pass everything down so we only deep-crawl venues we'll return.
         hc = HappyCowler(city_url, type_filter=type_filter,
                          max_results=max_results, sort_by=sort_by,
-                         min_rating=min_rating, radius_miles=radius_miles)
+                         min_rating=min_rating, radius_miles=radius_miles,
+                         refresh=refresh)
         hc.crawl()
     except Exception as exc:
         return json.dumps({"error": str(exc)})

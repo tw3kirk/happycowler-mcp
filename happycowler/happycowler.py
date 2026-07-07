@@ -17,6 +17,8 @@ longer server-render their venue cards, so the previous class-name scraping
 """
 from __future__ import division, print_function
 
+import hashlib
+import json
 import os
 import re
 import sys
@@ -88,6 +90,49 @@ def _throttle():
         if wait > 0:
             time.sleep(wait)
         _last_request_at[0] = time.monotonic()
+
+
+# Best-effort local disk cache for city listing crawls and venue detail
+# pages. A city crawl costs dozens of throttled requests, and repeat queries
+# against the same city (with different sorts/filters, which are applied
+# client-side) are common. Entries newer than the TTL are served from disk.
+# Env overrides: HAPPYCOW_CACHE_TTL (seconds; 0 disables) and
+# HAPPYCOW_CACHE_DIR (default ~/.cache/happycowler).
+_CACHE_TTL = float(os.environ.get("HAPPYCOW_CACHE_TTL", str(24 * 3600)))
+_CACHE_DIR = os.environ.get("HAPPYCOW_CACHE_DIR") or os.path.join(
+    os.path.expanduser("~"), ".cache", "happycowler")
+
+
+def _cache_path(kind, key):
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
+    return os.path.join(_CACHE_DIR, "{}-{}.json".format(kind, digest))
+
+
+def _cache_read(kind, key):
+    if _CACHE_TTL <= 0:
+        return None
+    try:
+        with open(_cache_path(kind, key)) as f:
+            entry = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if time.time() - entry.get("fetched_at", 0) > _CACHE_TTL:
+        return None
+    return entry.get("data")
+
+
+def _cache_write(kind, key, data):
+    if _CACHE_TTL <= 0:
+        return
+    path = _cache_path(kind, key)
+    try:
+        os.makedirs(_CACHE_DIR, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"fetched_at": time.time(), "data": data}, f)
+        os.replace(tmp, path)  # atomic: readers never see partial writes
+    except OSError:
+        pass  # the cache is an optimization, never an error
 
 
 def normalize(text):
@@ -319,6 +364,8 @@ class HappyCowler(object):
                        value (venues with no rating are dropped).
     :param radius_miles: Only keep venues within this distance of the city's
                          map seed point. 0/None disables the filter.
+    :param refresh: Skip the local cache and re-crawl (fresh results are
+                    still written back to the cache).
     :param max_pages: Safety cap on listing-endpoint pagination.
     :param workers: Thread pool size for concurrent deep crawls.
     :param request_delay: Optional politeness delay (seconds) between listing
@@ -330,8 +377,9 @@ class HappyCowler(object):
 
     def __init__(self, city_url, target_file=None, verbose=0, type_filter=None,
                  max_results=None, deep_crawl=True, sort_by=None,
-                 min_rating=None, radius_miles=None, max_pages=25, workers=8,
-                 request_delay=0.0, session=None):
+                 min_rating=None, radius_miles=None, refresh=False,
+                 max_pages=25, workers=8, request_delay=0.0, session=None):
+        self.refresh = bool(refresh)
         self.city_url = city_url if isinstance(city_url, list) else [city_url]
         self.target_file = target_file
         self.verbose = verbose
@@ -384,6 +432,12 @@ class HappyCowler(object):
         return key
 
     def _collect_listings(self, city_url):
+        if not self.refresh:
+            cached = _cache_read("listing", city_url)
+            if cached is not None:
+                # JSON round-trip turns coordinate tuples into lists.
+                return [dict(v, coordinates=tuple(v["coordinates"]))
+                        for v in cached]
         city_html = _http_get(self.session, city_url)
         lat, lng = extract_latlng(city_html)
         collected, seen = [], set()
@@ -402,6 +456,8 @@ class HappyCowler(object):
                 time.sleep(self.request_delay)
         for v in collected:
             v["distance_miles"] = self._distance_from(v, (lat, lng))
+        if collected:
+            _cache_write("listing", city_url, collected)
         return collected
 
     @staticmethod
@@ -421,6 +477,11 @@ class HappyCowler(object):
         url = venue["url"]
         if url in self._detail_cache:
             return self._detail_cache[url]
+        if not self.refresh:
+            cached = _cache_read("venue", url)
+            if cached is not None:
+                self._detail_cache[url] = cached
+                return cached
         for attempt in (1, 2):
             try:
                 detail = parse_venue_detail(_http_get(self.session, url))
@@ -428,6 +489,7 @@ class HappyCowler(object):
                 detail = dict(_EMPTY_DETAIL)
             if detail != _EMPTY_DETAIL:
                 self._detail_cache[url] = detail
+                _cache_write("venue", url, detail)
                 return detail
             if attempt == 1:
                 time.sleep(self.CHALLENGE_BACKOFF)  # let the WAF cool off
