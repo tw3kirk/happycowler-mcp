@@ -38,6 +38,7 @@ _SAMPLE_ENTRIES = [
         "name": "Green Heaven",
         "tag": "Vegan",
         "rating": "5.0",
+        "reviews": "16",
         "address": "10 Elm St, Worms, Germany",
         "phone": "+49 6241 12345",
         "hours": "Mon-Fri 11am-9pm",
@@ -83,6 +84,7 @@ def _make_mock_hc(entries):
     hc.names         = [e["name"]        for e in entries]
     hc.tags          = [e["tag"]         for e in entries]
     hc.ratings       = [e["rating"]      for e in entries]
+    hc.reviews       = [e.get("reviews", "") for e in entries]
     hc.addresses     = [e["address"]     for e in entries]
     hc.phone_numbers = [e["phone"]       for e in entries]
     hc.opening_hours = [e["hours"]       for e in entries]
@@ -114,7 +116,7 @@ class TestMCPSearchRestaurants(unittest.TestCase):
     def test_all_required_fields_present(self, MockHC):
         MockHC.return_value = _make_mock_hc(_SAMPLE_ENTRIES[:1])
         data = json.loads(search_restaurants("https://www.happycow.net/test/"))
-        required = {"name", "type", "rating", "address", "phone",
+        required = {"name", "type", "rating", "reviews", "address", "phone",
                     "hours", "cuisine", "description"}
         for field in required:
             self.assertIn(field, data[0], f"Missing field: {field}")
@@ -287,6 +289,7 @@ class TestCrawlPipelineWithFixtures(unittest.TestCase):
         hc = self._crawl()
         i = hc.names.index("Noqa Vegan")
         self.assertEqual(hc.ratings[i], "5.0")
+        self.assertEqual(hc.reviews[i], "41")
         self.assertEqual(hc.phone_numbers[i], "+51-960550950")
         self.assertEqual(hc.opening_hours[i], "Mon-Sun 10:00am-6:30pm")
         self.assertIn("Lima", hc.addresses[i])
@@ -342,7 +345,7 @@ class TestLiveHappyCow(unittest.TestCase):
                            "Expected at least one restaurant for Worms, Germany")
 
     def test_all_required_fields_present(self):
-        required = {"name", "type", "rating", "address",
+        required = {"name", "type", "rating", "reviews", "address",
                     "phone", "hours", "cuisine", "description"}
         for r in self._fetch(max_results=5):
             missing = required - set(r.keys())

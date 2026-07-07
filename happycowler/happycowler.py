@@ -212,6 +212,7 @@ def parse_venue_detail(review_html):
 
     return {
         "rating": rating,
+        "reviews": _microdata(soup, "reviewCount"),
         "address": address,
         "phone": _microdata(soup, "telephone"),
         "hours": hours,
@@ -222,7 +223,7 @@ def parse_venue_detail(review_html):
 
 
 _EMPTY_DETAIL = {
-    "rating": "unknown", "address": "", "phone": "",
+    "rating": "unknown", "reviews": "", "address": "", "phone": "",
     "hours": "", "cuisine": "", "description": "",
 }
 
@@ -266,6 +267,7 @@ class HappyCowler(object):
         self.names = []
         self.tags = []
         self.ratings = []
+        self.reviews = []
         self.addresses = []
         self.phone_numbers = []
         self.opening_hours = []
@@ -318,7 +320,7 @@ class HappyCowler(object):
         else:
             details = [self._fetch_detail(v) for v in listings]
 
-        coordinates, names, tags, ratings = [], [], [], []
+        coordinates, names, tags, ratings, reviews = [], [], [], [], []
         addresses, phones, hours, cuisines, descriptions = [], [], [], [], []
         for venue, detail in zip(listings, details):
             self.processed_entries += 1
@@ -329,6 +331,7 @@ class HappyCowler(object):
             names.append(normalize(venue["name"]))
             tags.append(normalize(venue["tag"]))
             ratings.append(detail["rating"])
+            reviews.append(detail["reviews"])
             addresses.append(normalize(detail["address"]))
             phones.append(normalize(detail["phone"]))
             hours.append(normalize(detail["hours"]))
@@ -345,6 +348,7 @@ class HappyCowler(object):
         self.names += names
         self.tags += tags
         self.ratings += ratings
+        self.reviews += reviews
         self.addresses += addresses
         self.phone_numbers += phones
         self.opening_hours += hours

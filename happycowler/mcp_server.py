@@ -59,6 +59,7 @@ def search_restaurants(
           - name        (str): Restaurant name
           - type        (str): "Vegan", "Vegetarian", or "Veg-friendly"
           - rating      (str): Star rating like "4.5", "3.0", or "unknown"
+          - reviews     (str): Number of reviews (e.g. "16"), or "" if none
           - address     (str): Street address
           - phone       (str): Phone number
           - hours       (str): Opening hours summary
@@ -91,6 +92,7 @@ def search_restaurants(
             "name": _clean(hc.names[i]),
             "type": tag,
             "rating": hc.ratings[i],
+            "reviews": hc.reviews[i],
             "address": _clean(hc.addresses[i]),
             "phone": _clean(hc.phone_numbers[i]),
             "hours": _clean(hc.opening_hours[i]),

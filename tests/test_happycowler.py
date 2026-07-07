@@ -78,6 +78,9 @@ class VenueDetailParser(unittest.TestCase):
     def test_rating_normalised(self):
         self.assertEqual(self.detail["rating"], "5.0")
 
+    def test_review_count(self):
+        self.assertEqual(self.detail["reviews"], "41")
+
     def test_address_composed_from_parts(self):
         self.assertEqual(self.detail["address"],
                          "Av Paseo de la República, Lima, Peru")
@@ -93,6 +96,9 @@ class VenueDetailParser(unittest.TestCase):
 
     def test_missing_rating_is_unknown(self):
         self.assertEqual(parse_venue_detail("<html></html>")["rating"], "unknown")
+
+    def test_missing_review_count_is_empty(self):
+        self.assertEqual(parse_venue_detail("<html></html>")["reviews"], "")
 
 
 if __name__ == '__main__':
