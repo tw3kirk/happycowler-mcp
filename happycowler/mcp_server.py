@@ -32,17 +32,17 @@ def search_restaurants(
         https://www.happycow.net/{region}/{country}/{city}/
 
     Common region slugs:
-        europe, north-america, south-america, asia, africa, oceania, middle-east
+        europe, north_america, south_america, asia, africa, oceania, middle_east
 
     URL examples:
-        Lima, Peru        -> https://www.happycow.net/south-america/peru/lima/
+        Lima, Peru        -> https://www.happycow.net/south_america/peru/lima/
         Tokyo, Japan      -> https://www.happycow.net/asia/japan/tokyo/
         Berlin, Germany   -> https://www.happycow.net/europe/germany/berlin/
-        New York, USA     -> https://www.happycow.net/north-america/usa/new-york/
+        New York, USA     -> https://www.happycow.net/north_america/usa/new-york/
         London, UK        -> https://www.happycow.net/europe/england/london/
         Sydney, Australia -> https://www.happycow.net/oceania/australia/sydney/
         Bangkok, Thailand -> https://www.happycow.net/asia/thailand/bangkok/
-        Mexico City       -> https://www.happycow.net/north-america/mexico/mexico-city/
+        Mexico City       -> https://www.happycow.net/north_america/mexico/mexico-city/
 
     Args:
         city_url: Full HappyCow URL for the city listing page.
@@ -58,6 +58,7 @@ def search_restaurants(
           - name        (str): Restaurant name
           - type        (str): "Vegan", "Vegetarian", or "Veg-friendly"
           - rating      (str): Star rating like "4.5", "3.0", or "unknown"
+          - reviews     (str): Number of reviews (e.g. "16"), or "" if none
           - address     (str): Street address
           - phone       (str): Phone number
           - hours       (str): Opening hours summary
@@ -89,6 +90,7 @@ def search_restaurants(
             "name": _clean(hc.names[i]),
             "type": tag,
             "rating": hc.ratings[i],
+            "reviews": hc.reviews[i],
             "address": _clean(hc.addresses[i]),
             "phone": _clean(hc.phone_numbers[i]),
             "hours": _clean(hc.opening_hours[i]),

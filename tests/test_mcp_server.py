@@ -7,9 +7,10 @@ There are three test suites here:
   TestMCPSearchRestaurants   – unit tests; mock HappyCowler so no HTTP is
                                needed.  These always run.
 
-  TestParsingWithWormsFixture – unit tests; exercise the real parser against
-                               the 2017-era Worms, Germany HTML fixture that
-                               ships with the repo.  Always run.
+  TestSearchEndToEnd         – unit tests; run search_restaurants over the
+                               real parser against the bundled rendered-text
+                               fixture (only the Playwright fetch is mocked).
+                               Always run.
 
   TestLiveHappyCow           – integration tests that hit happycow.net over
                                the network.  Skipped by default.  Enable with:
@@ -23,8 +24,6 @@ import json
 import os
 import unittest
 from unittest.mock import MagicMock, patch
-
-from bs4 import BeautifulSoup
 
 from happycowler import HappyCowler
 from happycowler.mcp_server import search_restaurants
@@ -40,6 +39,7 @@ _SAMPLE_ENTRIES = [
         "name": "Green Heaven",
         "tag": "Vegan",
         "rating": "5.0",
+        "reviews": "16",
         "address": "10 Elm St, Worms, Germany",
         "phone": "+49 6241 12345",
         "hours": "Mon-Fri 11am-9pm",
@@ -85,6 +85,7 @@ def _make_mock_hc(entries):
     hc.names         = [e["name"]        for e in entries]
     hc.tags          = [e["tag"]         for e in entries]
     hc.ratings       = [e["rating"]      for e in entries]
+    hc.reviews       = [e.get("reviews", "") for e in entries]
     hc.addresses     = [e["address"]     for e in entries]
     hc.phone_numbers = [e["phone"]       for e in entries]
     hc.opening_hours = [e["hours"]       for e in entries]
@@ -116,7 +117,7 @@ class TestMCPSearchRestaurants(unittest.TestCase):
     def test_all_required_fields_present(self, MockHC):
         MockHC.return_value = _make_mock_hc(_SAMPLE_ENTRIES[:1])
         data = json.loads(search_restaurants("https://www.happycow.net/test/"))
-        required = {"name", "type", "rating", "address", "phone",
+        required = {"name", "type", "rating", "reviews", "address", "phone",
                     "hours", "cuisine", "description"}
         for field in required:
             self.assertIn(field, data[0], f"Missing field: {field}")
@@ -233,83 +234,79 @@ class TestMCPSearchRestaurants(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Suite 2: Parser unit tests against the bundled HTML fixture
+# Suite 2: End-to-end through the real parser (only the browser fetch mocked)
 # ---------------------------------------------------------------------------
 
 _DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_pages/")
 
 
-class TestParsingWithWormsFixture(unittest.TestCase):
-    """Verify every field the parser extracts from the bundled 2017 fixture.
+def _fixture_text():
+    with open(_DATA_PATH + "montrose_listing.txt", "r") as f:
+        return f.read()
 
-    This gives us a regression baseline: if any selector breaks (e.g. because
-    we upgrade BeautifulSoup or refactor the parser) these tests will catch it.
+
+class TestSearchEndToEnd(unittest.TestCase):
+    """Run search_restaurants over the real HappyCowler + parser.
+
+    Only ``_render_text`` (the Playwright subprocess) is patched, so this
+    covers URL normalization, crawl(), parse_listing_text() and the JSON
+    shaping in one pass.
     """
 
-    @classmethod
-    def setUpClass(cls):
-        path = _DATA_PATH + "Vegan & Vegetarian Restaurants in Worms, Germany.htm"
-        with open(path, "r") as f:
-            text = f.read()
-        parsed = BeautifulSoup(text, "html.parser")
-        cls.hc = HappyCowler("")
-        cls.hc._parse_results_page(parsed, page_no="", deep_crawl=False)
+    def _search(self, **kwargs):
+        with patch("happycowler.happycowler._render_text",
+                   return_value=_fixture_text()):
+            return json.loads(
+                search_restaurants(
+                    "https://www.happycow.net/north_america/usa/montrose/",
+                    **kwargs,
+                )
+            )
 
-    def test_total_entries_count(self):
-        self.assertEqual(self.hc.total_entries, 2)
-
-    def test_restaurant_names(self):
-        self.assertEqual(self.hc.names, ["Frollein Elfriede", "Eis Vannini"])
-
-    def test_restaurant_tags(self):
-        self.assertEqual(self.hc.tags, ["Catering", "Other"])
-
-    def test_ratings_unknown_when_no_stars(self):
-        # Neither fixture restaurant has star ratings
-        self.assertEqual(self.hc.ratings, ["unknown", "unknown"])
-
-    def test_addresses(self):
+    def test_returns_all_fixture_venues(self):
+        data = self._search()
         self.assertEqual(
-            self.hc.addresses,
-            [
-                "Kleine Wollgasse 7, Worms, Germany",
-                "Am Marktplatz, Neuemarkt Strasse, Worms, Germany",
-            ],
+            [r["name"] for r in data],
+            ["Pure Roots Cafe", "Green Sprout Kitchen", "Camp Robber",
+             "Natural Grocers"],
         )
 
-    def test_phone_numbers(self):
-        self.assertEqual(self.hc.phone_numbers, ["06241324440", "n/a"])
+    def test_vegan_filter(self):
+        data = self._search(type_filter="vegan")
+        self.assertEqual([r["name"] for r in data], ["Pure Roots Cafe"])
+        self.assertEqual(data[0]["rating"], "5.0")
+        self.assertEqual(data[0]["reviews"], "12")
 
-    def test_opening_hours(self):
-        # Frollein Elfriede: "Call for hours" (data-summary contains an <a> tag)
-        self.assertIn("Call for hours", self.hc.opening_hours[0])
-        # Eis Vannini: concrete hours
-        self.assertEqual(self.hc.opening_hours[1], "Mon-Sun 10:00am-11:00pm")
+    def test_full_record_shape(self):
+        r = self._search()[1]  # Green Sprout Kitchen
+        self.assertEqual(r["type"],        "Vegetarian")
+        self.assertEqual(r["rating"],      "4.5")
+        self.assertEqual(r["reviews"],     "8")
+        self.assertEqual(r["address"],     "5 Oak Ave, Montrose, Colorado, USA")
+        self.assertEqual(r["phone"],       "")  # "Add a phone number" placeholder
+        self.assertEqual(r["hours"],       "Closed")
+        self.assertEqual(r["cuisine"],     "Vegetarian, Indian")
 
-    def test_descriptions(self):
-        self.assertEqual(
-            self.hc.descriptions,
-            [
-                "Vegan catering service.",
-                "Italian ice cream parlor with several locations. Offers also vegan varieties.",
-            ],
-        )
+    def test_hyphenated_region_url_accepted(self):
+        with patch("happycowler.happycowler._render_text",
+                   return_value=_fixture_text()) as mock_render:
+            search_restaurants(
+                "https://www.happycow.net/north-america/usa/montrose/")
+        fetched_url = mock_render.call_args[0][0]
+        self.assertIn("/north_america/", fetched_url)
 
-    def test_coordinates_empty_without_deep_crawl(self):
-        # deep_crawl=False means coordinates should be empty strings
-        for coord in self.hc.coordinates:
+    def test_crawler_coordinates_placeholder(self):
+        with patch("happycowler.happycowler._render_text",
+                   return_value=_fixture_text()):
+            hc = HappyCowler("https://www.happycow.net/north_america/usa/montrose/")
+            hc.crawl()
+        n = len(hc.names)
+        self.assertEqual(n, 4)
+        for attr in ("tags", "ratings", "reviews", "addresses", "phone_numbers",
+                     "opening_hours", "cuisines", "descriptions", "coordinates"):
+            self.assertEqual(len(getattr(hc, attr)), n)
+        for coord in hc.coordinates:
             self.assertEqual(coord, ("", ""))
-
-    def test_result_lists_are_equal_length(self):
-        n = len(self.hc.names)
-        self.assertEqual(len(self.hc.tags),          n)
-        self.assertEqual(len(self.hc.ratings),       n)
-        self.assertEqual(len(self.hc.addresses),     n)
-        self.assertEqual(len(self.hc.phone_numbers), n)
-        self.assertEqual(len(self.hc.opening_hours), n)
-        self.assertEqual(len(self.hc.cuisines),      n)
-        self.assertEqual(len(self.hc.descriptions),  n)
-        self.assertEqual(len(self.hc.coordinates),   n)
 
 
 # ---------------------------------------------------------------------------
@@ -322,8 +319,8 @@ _LIVE = os.getenv("HAPPYCOW_RUN_LIVE_TESTS")
 class TestLiveHappyCow(unittest.TestCase):
     """Integration tests against the live happycow.net website.
 
-    These are the definitive check that the HTML parsers still work with
-    HappyCow's *current* page structure.  They make real HTTP requests.
+    These are the definitive check that the fetcher + parser still work with
+    HappyCow's *current* site.  They launch a real headless Chrome.
 
     Usage:
         HAPPYCOW_RUN_LIVE_TESTS=1 python -m pytest tests/test_mcp_server.py::TestLiveHappyCow -v
@@ -345,7 +342,7 @@ class TestLiveHappyCow(unittest.TestCase):
                            "Expected at least one restaurant for Worms, Germany")
 
     def test_all_required_fields_present(self):
-        required = {"name", "type", "rating", "address",
+        required = {"name", "type", "rating", "reviews", "address",
                     "phone", "hours", "cuisine", "description"}
         for r in self._fetch(max_results=5):
             missing = required - set(r.keys())
@@ -357,7 +354,9 @@ class TestLiveHappyCow(unittest.TestCase):
             self.assertTrue(r["name"].strip(), "Restaurant name should not be empty")
 
     def test_type_is_known_value(self):
-        valid = {"Vegan", "Vegetarian", "Veg-friendly", "Other", "Catering", ""}
+        valid = {"Vegan", "Vegetarian", "Veg-friendly", "Other", "Catering",
+                 "Health Food Store", "Cafe", "Bakery", "Food Truck",
+                 "Juice Bar", "Market", ""}
         for r in self._fetch(max_results=10):
             self.assertTrue(
                 any(t in r["type"] for t in valid),
