@@ -1,6 +1,9 @@
 import os
+import time
 import unittest
+from unittest.mock import patch
 
+from happycowler import happycowler as hc_mod
 from happycowler.happycowler import (
     classify_type,
     extract_latlng,
@@ -11,6 +14,25 @@ from happycowler.happycowler import (
 
 data_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          'test_pages/')
+
+
+class RequestThrottle(unittest.TestCase):
+
+    def test_spaces_consecutive_requests(self):
+        with patch.object(hc_mod, "_MIN_REQUEST_INTERVAL", 0.1):
+            hc_mod._last_request_at[0] = 0.0
+            start = time.monotonic()
+            hc_mod._throttle()  # first call: no wait
+            hc_mod._throttle()  # second call: must wait out the interval
+            elapsed = time.monotonic() - start
+        self.assertGreaterEqual(elapsed, 0.1)
+
+    def test_zero_interval_disables_throttle(self):
+        with patch.object(hc_mod, "_MIN_REQUEST_INTERVAL", 0.0):
+            start = time.monotonic()
+            for _ in range(50):
+                hc_mod._throttle()
+            self.assertLess(time.monotonic() - start, 0.05)
 
 
 class TypeClassification(unittest.TestCase):
@@ -66,6 +88,33 @@ class ListingFragmentParser(unittest.TestCase):
         by_name = {v["name"]: v["tag"] for v in self.venues}
         self.assertEqual(by_name["Noqa Vegan"], "Vegan")
         self.assertEqual(by_name["ConSuLado Vegano"], "Vegan")
+
+    def test_card_rating_and_review_count(self):
+        by_name = {v["name"]: v for v in self.venues}
+        self.assertEqual(by_name["Chocotejas Veganas"]["rating"], "4.5")
+        self.assertEqual(by_name["Chocotejas Veganas"]["reviews"], "3")
+
+    def test_all_cards_have_rating_keys(self):
+        for v in self.venues:
+            self.assertIn("rating", v)
+            self.assertIn("reviews", v)
+
+
+class TopRatedCardParser(unittest.TestCase):
+    """"Top Rated" venues show a badge *instead of* a review count on their
+    listing cards — the count only exists on the venue detail page. The card
+    parser must still read the rating and leave reviews empty (not crash or
+    mis-parse the badge)."""
+
+    def test_top_rated_badge_hides_review_count(self):
+        with open(data_path + "toprated_card_snippet.html") as f:
+            venues = parse_listing_fragment(f.read())
+        self.assertEqual(len(venues), 1)
+        v = venues[0]
+        self.assertEqual(v["name"], "Watercourse Foods")
+        self.assertEqual(v["rating"], "4.5")
+        self.assertEqual(v["reviews"], "")
+        self.assertEqual(v["tag"], "Vegan")
 
 
 class VenueDetailParser(unittest.TestCase):

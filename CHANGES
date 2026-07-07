@@ -1,3 +1,15 @@
+Version 0.3.1: 2026-07-07
+  - New: Global politeness throttle — at most one HTTP request per second to
+    HappyCow, shared across all threads. Override the interval (or disable
+    with 0) via the HAPPYCOW_MIN_REQUEST_INTERVAL environment variable.
+    Sustained faster crawling trips the WAF, which then serves challenge
+    pages that silently empty the deep-crawl fields.
+  - New: Listing cards' own rating and review count are parsed, so ratings
+    survive deep_crawl=False and blocked detail fetches. Caveat: "Top Rated"
+    venues show a badge instead of a count on their card; their review count
+    only exists on the venue detail page (schema.org reviewCount).
+  - New: reviews (review count) result column and MCP output field.
+
 Version 0.3.0: 2026-07-03
   - Fixed: Crawler rewritten for HappyCow's current JavaScript-rendered site.
     The old server-side listing markup (div.row.venue-list-item, the "(N)"

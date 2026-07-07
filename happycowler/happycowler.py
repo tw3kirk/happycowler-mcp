@@ -17,8 +17,10 @@ longer server-render their venue cards, so the previous class-name scraping
 """
 from __future__ import division, print_function
 
+import os
 import re
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -68,6 +70,25 @@ class HappyCowError(Exception):
     structure changed so the expected data could not be located."""
 
 
+# Global politeness throttle: at most one request to HappyCow per interval,
+# across all threads (deep crawls run in a pool). Keeps the crawler a good
+# citizen and below the WAF's suspicion threshold. Override (or disable with
+# 0) via the HAPPYCOW_MIN_REQUEST_INTERVAL environment variable.
+_MIN_REQUEST_INTERVAL = float(os.environ.get("HAPPYCOW_MIN_REQUEST_INTERVAL", "1.0"))
+_throttle_lock = threading.Lock()
+_last_request_at = [0.0]
+
+
+def _throttle():
+    if _MIN_REQUEST_INTERVAL <= 0:
+        return
+    with _throttle_lock:
+        wait = _last_request_at[0] + _MIN_REQUEST_INTERVAL - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _last_request_at[0] = time.monotonic()
+
+
 def normalize(text):
     """Escape ampersands (so downstream XML/KML/GPX output is valid) and strip."""
     processed_text = (text or "").replace("&", "&amp;")
@@ -87,6 +108,7 @@ def _new_session(user_agent=DEFAULT_USER_AGENT):
 
 
 def _http_get(session, url, xhr=False, as_json=False, timeout=30):
+    _throttle()
     headers = {}
     if xhr:
         headers["X-Requested-With"] = "XMLHttpRequest"
@@ -148,10 +170,33 @@ def classify_type(data_type, vegan="0", vegonly="0"):
     return label
 
 
+# A listing card shows its rating as two adjacent divs inside an <li>:
+# ``<div>4.5</div><div>(12)</div>``.
+_CARD_RATING_RE = re.compile(r"^[0-5](\.\d)?$")
+_CARD_COUNT_RE = re.compile(r"^\((\d+)\)$")
+
+
+def _card_rating(card):
+    """Read the rating and review count shown on a listing card."""
+    for div in card.find_all("div"):
+        text = div.get_text(strip=True)
+        if div.parent.name == "li" and _CARD_RATING_RE.match(text):
+            reviews = ""
+            sibling = div.find_next_sibling("div")
+            if sibling:
+                match = _CARD_COUNT_RE.match(sibling.get_text(strip=True))
+                if match:
+                    reviews = match.group(1)
+            return text, reviews
+    return "unknown", ""
+
+
 def parse_listing_fragment(fragment_html):
     """Parse the HTML fragment returned by the ``/ajax/.../venues`` endpoint.
 
-    Returns a list of dicts with keys: name, url, tag, coordinates.
+    Returns a list of dicts with keys: name, url, tag, coordinates, rating,
+    reviews. Rating/reviews come from the card itself, so they are available
+    even without a deep crawl of the venue page.
     """
     soup = BeautifulSoup(fragment_html or "", "html.parser")
     venues = []
@@ -171,11 +216,14 @@ def parse_listing_fragment(fragment_html):
             coords = (details.get("data-lat", ""), details.get("data-lng", ""))
         else:
             data_type, vegan, vegonly, coords = "", "0", "0", ("", "")
+        rating, reviews = _card_rating(card)
         venues.append({
             "name": name,
             "url": BASE_URL + link["href"],
             "tag": classify_type(data_type, vegan, vegonly),
             "coordinates": coords,
+            "rating": rating,
+            "reviews": reviews,
         })
     return venues
 
@@ -330,8 +378,13 @@ class HappyCowler(object):
             coordinates.append(venue["coordinates"])
             names.append(normalize(venue["name"]))
             tags.append(normalize(venue["tag"]))
-            ratings.append(detail["rating"])
-            reviews.append(detail["reviews"])
+            # Prefer detail-page values; fall back to the listing card's own
+            # rating/count (covers deep_crawl=False and blocked detail fetches).
+            rating = detail["rating"]
+            if rating == "unknown":
+                rating = venue.get("rating", "unknown")
+            ratings.append(rating)
+            reviews.append(detail["reviews"] or venue.get("reviews", ""))
             addresses.append(normalize(detail["address"]))
             phones.append(normalize(detail["phone"]))
             hours.append(normalize(detail["hours"]))
