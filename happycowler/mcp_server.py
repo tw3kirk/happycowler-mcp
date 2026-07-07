@@ -22,11 +22,17 @@ def search_restaurants(
     city_url: str,
     type_filter: str = "all",
     max_results: int = 50,
+    sort_by: str = "default",
+    min_rating: float = 0,
+    radius_miles: float = 0,
 ) -> str:
     """Search for vegan and vegetarian restaurants on HappyCow.net for a given city.
 
     Crawls the HappyCow city listing page and returns structured restaurant data
-    including name, type, rating, address, phone, hours, cuisine, and description.
+    including name, type, rating, review count, distance, address, phone, hours,
+    and description. Supports sorting (distance / rating / popularity) and
+    filtering (type / minimum stars / radius); sorting and filtering happen
+    before max_results, so "top N by X" queries work as expected.
 
     HappyCow URL format:
         https://www.happycow.net/{region}/{country}/{city}/
@@ -53,24 +59,38 @@ def search_restaurants(
             "vegetarian"   - vegetarian restaurants (may serve dairy/eggs)
             "veg-friendly" - restaurants with good vegan/vegetarian options
         max_results: Maximum number of restaurants to return (default 50).
+        sort_by: Result ordering. One of:
+            "default"     - HappyCow's own listing order
+            "distance"    - nearest to the city center first
+            "rating"      - highest star rating first (ties: more reviews first)
+            "popularity"  - most-reviewed first
+        min_rating: Only return venues rated at least this many stars
+            (e.g. 4.0). Unrated venues are dropped. 0 disables (default).
+        radius_miles: Only return venues within this many miles of the city
+            center (e.g. 50). 0 disables (default).
 
     Returns:
         JSON array of restaurant objects. Each object contains:
-          - name        (str): Restaurant name
-          - type        (str): "Vegan", "Vegetarian", or "Veg-friendly"
-          - rating      (str): Star rating like "4.5", "3.0", or "unknown"
-          - reviews     (str): Number of reviews (e.g. "16"), or "" if none
-          - address     (str): Street address
-          - phone       (str): Phone number
-          - hours       (str): Opening hours summary
-          - cuisine     (str): Cuisine type(s)
-          - description (str): Short description of the restaurant
+          - name           (str): Restaurant name
+          - type           (str): "Vegan", "Vegetarian", or "Veg-friendly"
+          - rating         (str): Star rating like "4.5", "3.0", or "unknown"
+          - reviews        (str): Number of reviews (e.g. "16"), or "" if none
+          - distance_miles (float|null): Miles from the city center
+          - latitude       (str): Venue latitude
+          - longitude      (str): Venue longitude
+          - address        (str): Street address
+          - phone          (str): Phone number
+          - hours          (str): Opening hours summary
+          - cuisine        (str): Cuisine type(s)
+          - description    (str): Short description of the restaurant
 
         On error returns: {"error": "<message>"}
     """
     try:
-        # Pass the filter/cap down so we only deep-crawl venues we'll return.
-        hc = HappyCowler(city_url, type_filter=type_filter, max_results=max_results)
+        # Pass everything down so we only deep-crawl venues we'll return.
+        hc = HappyCowler(city_url, type_filter=type_filter,
+                         max_results=max_results, sort_by=sort_by,
+                         min_rating=min_rating, radius_miles=radius_miles)
         hc.crawl()
     except Exception as exc:
         return json.dumps({"error": str(exc)})
@@ -93,6 +113,10 @@ def search_restaurants(
             "type": tag,
             "rating": hc.ratings[i],
             "reviews": hc.reviews[i],
+            "distance_miles": (round(hc.distances[i], 1)
+                               if hc.distances[i] is not None else None),
+            "latitude": hc.coordinates[i][0],
+            "longitude": hc.coordinates[i][1],
             "address": _clean(hc.addresses[i]),
             "phone": _clean(hc.phone_numbers[i]),
             "hours": _clean(hc.opening_hours[i]),

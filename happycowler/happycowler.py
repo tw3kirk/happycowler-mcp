@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from math import asin, cos, radians, sin, sqrt
 
 from bs4 import BeautifulSoup
 
@@ -140,14 +141,25 @@ def get_parsed_html(url, session=None):
 
 
 def extract_latlng(city_html):
-    """Pull the (lat, lng) the city listing page uses to seed its map search."""
-    match = _LATLNG_RE.search(city_html)
-    if not match:
+    """Derive the (lat, lng) map seed from a city listing page.
+
+    The page carries no canonical coordinates for the city itself — its
+    ``/searchmap?lat=..&lng=..`` links are the *nearby cities* sidebar (~20
+    suburbs). Taking the first link seeds the crawl on a random suburb and
+    makes distances/coverage wobble between fetches, so use the
+    component-wise median of all links: the suburbs surround the city, their
+    median lands near its center, and it is stable regardless of link order.
+    """
+    matches = _LATLNG_RE.findall(city_html)
+    if not matches:
         raise HappyCowError(
             "Could not find map coordinates on the city page. HappyCow's page "
             "structure may have changed, or this is not a valid city listing URL."
         )
-    return match.group(1), match.group(2)
+    lats = sorted(float(lat) for lat, _ in matches)
+    lngs = sorted(float(lng) for _, lng in matches)
+    mid = len(matches) // 2
+    return repr(lats[mid]), repr(lngs[mid])
 
 
 def classify_type(data_type, vegan="0", vegonly="0"):
@@ -228,6 +240,15 @@ def parse_listing_fragment(fragment_html):
     return venues
 
 
+def haversine_miles(lat1, lng1, lat2, lng2):
+    """Great-circle distance in miles between two (lat, lng) points."""
+    lat1, lng1, lat2, lng2 = map(radians, (float(lat1), float(lng1),
+                                           float(lat2), float(lng2)))
+    a = sin((lat2 - lat1) / 2) ** 2 + \
+        cos(lat1) * cos(lat2) * sin((lng2 - lng1) / 2) ** 2
+    return 3958.8 * 2 * asin(sqrt(a))
+
+
 def _microdata(soup, prop):
     """Read a schema.org microdata value: prefer the ``content`` attribute,
     else the element text. Returns '' when the property is absent."""
@@ -289,6 +310,15 @@ class HappyCowler(object):
     :param max_results: Cap the number of venues per city (bounds deep crawls).
     :param deep_crawl: When True (default) fetch each venue's review page to
                        fill rating/address/phone/hours/description.
+    :param sort_by: 'distance' (from the city's map seed point, nearest
+                    first), 'rating' (stars, best first), 'popularity'
+                    (review count, most first), or None/'default' for
+                    HappyCow's own listing order. Sorting happens before
+                    ``max_results`` slicing, so "top N by X" works.
+    :param min_rating: Only keep venues whose star rating is at least this
+                       value (venues with no rating are dropped).
+    :param radius_miles: Only keep venues within this distance of the city's
+                         map seed point. 0/None disables the filter.
     :param max_pages: Safety cap on listing-endpoint pagination.
     :param workers: Thread pool size for concurrent deep crawls.
     :param request_delay: Optional politeness delay (seconds) between listing
@@ -296,8 +326,11 @@ class HappyCowler(object):
     :param session: Optional pre-built ``requests.Session``.
     """
 
+    SORTS = ("default", "distance", "rating", "popularity")
+
     def __init__(self, city_url, target_file=None, verbose=0, type_filter=None,
-                 max_results=None, deep_crawl=True, max_pages=25, workers=8,
+                 max_results=None, deep_crawl=True, sort_by=None,
+                 min_rating=None, radius_miles=None, max_pages=25, workers=8,
                  request_delay=0.0, session=None):
         self.city_url = city_url if isinstance(city_url, list) else [city_url]
         self.target_file = target_file
@@ -305,10 +338,14 @@ class HappyCowler(object):
         self.type_filter = self._normalize_filter(type_filter)
         self.max_results = max_results
         self.deep_crawl = deep_crawl
+        self.sort_by = self._normalize_sort(sort_by)
+        self.min_rating = float(min_rating) if min_rating else None
+        self.radius_miles = float(radius_miles) if radius_miles else None
         self.max_pages = max_pages
         self.workers = max(1, workers)
         self.request_delay = request_delay
         self.session = session or _new_session()
+        self._detail_cache = {}
 
         # Public result columns (kept for backwards compatibility).
         self.coordinates = []
@@ -316,6 +353,7 @@ class HappyCowler(object):
         self.tags = []
         self.ratings = []
         self.reviews = []
+        self.distances = []
         self.addresses = []
         self.phone_numbers = []
         self.opening_hours = []
@@ -334,6 +372,17 @@ class HappyCowler(object):
             "veg-friendly": "Veg-friendly",
         }.get(type_filter.lower())
 
+    @classmethod
+    def _normalize_sort(cls, sort_by):
+        if not sort_by or sort_by == "default":
+            return None
+        key = str(sort_by).lower().replace("stars", "rating")
+        if key not in cls.SORTS:
+            raise HappyCowError(
+                "Unknown sort_by {!r}; expected one of {}."
+                .format(sort_by, ", ".join(cls.SORTS)))
+        return key
+
     def _collect_listings(self, city_url):
         city_html = _http_get(self.session, city_url)
         lat, lng = extract_latlng(city_html)
@@ -351,15 +400,75 @@ class HappyCowler(object):
             collected.extend(new)
             if self.request_delay:
                 time.sleep(self.request_delay)
+        for v in collected:
+            v["distance_miles"] = self._distance_from(v, (lat, lng))
         return collected
 
-    def _fetch_detail(self, venue):
-        if not self.deep_crawl:
-            return dict(_EMPTY_DETAIL)
+    @staticmethod
+    def _distance_from(venue, seed):
         try:
-            return parse_venue_detail(_http_get(self.session, venue["url"]))
-        except (HappyCowError, RequestException):
+            return haversine_miles(seed[0], seed[1], *venue["coordinates"])
+        except (TypeError, ValueError):
+            return None
+
+    # Seconds to wait before retrying a fetch the WAF answered with a
+    # challenge page (a 200 with no microdata) instead of data.
+    CHALLENGE_BACKOFF = 5.0
+
+    def _fetch_detail(self, venue, force=False):
+        if not (self.deep_crawl or force):
             return dict(_EMPTY_DETAIL)
+        url = venue["url"]
+        if url in self._detail_cache:
+            return self._detail_cache[url]
+        for attempt in (1, 2):
+            try:
+                detail = parse_venue_detail(_http_get(self.session, url))
+            except (HappyCowError, RequestException):
+                detail = dict(_EMPTY_DETAIL)
+            if detail != _EMPTY_DETAIL:
+                self._detail_cache[url] = detail
+                return detail
+            if attempt == 1:
+                time.sleep(self.CHALLENGE_BACKOFF)  # let the WAF cool off
+        return dict(_EMPTY_DETAIL)  # never cache failures
+
+    @staticmethod
+    def _rating_value(venue):
+        try:
+            return float(venue.get("rating", ""))
+        except ValueError:
+            return None
+
+    def _apply_filters(self, listings):
+        if self.type_filter:
+            listings = [v for v in listings if self.type_filter in v["tag"]]
+        if self.radius_miles:
+            listings = [v for v in listings
+                        if v["distance_miles"] is not None
+                        and v["distance_miles"] <= self.radius_miles]
+        if self.min_rating:
+            listings = [v for v in listings
+                        if self._rating_value(v) is not None
+                        and self._rating_value(v) >= self.min_rating]
+        return listings
+
+    def _apply_sort(self, listings):
+        if self.sort_by == "distance":
+            return sorted(listings, key=lambda v: (
+                v["distance_miles"] is None, v["distance_miles"] or 0))
+        if self.sort_by == "rating":
+            return sorted(listings, key=lambda v: (
+                -(self._rating_value(v) or -1), -int(v["reviews"] or 0)))
+        if self.sort_by == "popularity":
+            # "Top Rated" cards hide their review count; fill those (and only
+            # those) from the venue page's reviewCount before ranking.
+            for v in listings:
+                if not v["reviews"] and self._rating_value(v) is not None:
+                    detail = self._fetch_detail(v, force=True)
+                    v["reviews"] = detail["reviews"] or v["reviews"]
+            return sorted(listings, key=lambda v: -int(v["reviews"] or 0))
+        return listings
 
     def _store(self, listings):
         if self.deep_crawl and len(listings) > 1:
@@ -376,6 +485,7 @@ class HappyCowler(object):
                 sys.stdout.write("\r\x1b[KProcessed: " + venue["name"])
                 sys.stdout.flush()
             coordinates.append(venue["coordinates"])
+            self.distances.append(venue.get("distance_miles"))
             names.append(normalize(venue["name"]))
             tags.append(normalize(venue["tag"]))
             # Prefer detail-page values; fall back to the listing card's own
@@ -415,10 +525,9 @@ class HappyCowler(object):
         for city_url in self.city_url:
             if self.verbose:
                 print(city_url)
-            listings = self._collect_listings(city_url)
-            if self.type_filter:
-                listings = [v for v in listings if self.type_filter in v["tag"]]
+            listings = self._apply_filters(self._collect_listings(city_url))
             self.total_entries += len(listings)
+            listings = self._apply_sort(listings)
             if self.max_results is not None:
                 listings = listings[:self.max_results]
             self._store(listings)

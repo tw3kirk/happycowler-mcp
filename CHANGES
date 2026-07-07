@@ -1,3 +1,18 @@
+Version 0.4.0: 2026-07-07
+  - New: sort_by (default | distance | rating | popularity), min_rating, and
+    radius_miles parameters on HappyCowler and the search_restaurants MCP
+    tool. Sorting and filtering run before max_results, so "top N by X"
+    queries work. Popularity sort fills the review counts that "Top Rated"
+    cards hide from the venue pages before ranking.
+  - New: distance_miles, latitude, longitude fields in MCP output; distances
+    result column on HappyCowler.
+  - Fixed: the map seed is now the median of the city page's nearby-city
+    links. The page has no canonical coordinates for the city itself, and
+    seeding from the first link (a random suburb) skewed distances and made
+    crawl coverage vary between runs.
+  - Fixed: WAF challenge pages (HTTP 200 with no microdata) are no longer
+    cached as venue details; challenged fetches back off 5s and retry once.
+
 Version 0.3.1: 2026-07-07
   - New: Global politeness throttle — at most one HTTP request per second to
     HappyCow, shared across all threads. Override the interval (or disable

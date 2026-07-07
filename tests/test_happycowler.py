@@ -61,6 +61,16 @@ class LatLngExtraction(unittest.TestCase):
         with self.assertRaises(HappyCowError):
             extract_latlng("<html><body>no map here</body></html>")
 
+    def test_median_of_nearby_city_links(self):
+        # The links are the nearby-cities sidebar; the median approximates
+        # the city's own center and is stable regardless of link order.
+        html = "".join(
+            '<a href="/searchmap?lat={}&amp;lng={}">x</a>'.format(lat, lng)
+            for lat, lng in [("39.9", "-105.2"), ("39.7", "-104.9"),
+                             ("39.8", "-105.0")]
+        )
+        self.assertEqual(extract_latlng(html), ("39.8", "-105.0"))
+
 
 class ListingFragmentParser(unittest.TestCase):
 

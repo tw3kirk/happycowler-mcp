@@ -85,6 +85,8 @@ def _make_mock_hc(entries):
     hc.tags          = [e["tag"]         for e in entries]
     hc.ratings       = [e["rating"]      for e in entries]
     hc.reviews       = [e.get("reviews", "") for e in entries]
+    hc.distances     = [e.get("miles")   for e in entries]
+    hc.coordinates   = [e.get("coords", ("", "")) for e in entries]
     hc.addresses     = [e["address"]     for e in entries]
     hc.phone_numbers = [e["phone"]       for e in entries]
     hc.opening_hours = [e["hours"]       for e in entries]
@@ -116,7 +118,8 @@ class TestMCPSearchRestaurants(unittest.TestCase):
     def test_all_required_fields_present(self, MockHC):
         MockHC.return_value = _make_mock_hc(_SAMPLE_ENTRIES[:1])
         data = json.loads(search_restaurants("https://www.happycow.net/test/"))
-        required = {"name", "type", "rating", "reviews", "address", "phone",
+        required = {"name", "type", "rating", "reviews", "distance_miles",
+                    "latitude", "longitude", "address", "phone",
                     "hours", "cuisine", "description"}
         for field in required:
             self.assertIn(field, data[0], f"Missing field: {field}")
@@ -303,6 +306,48 @@ class TestCrawlPipelineWithFixtures(unittest.TestCase):
         hc = self._crawl(max_results=2, deep_crawl=False)
         self.assertEqual(len(hc.names), 2)
 
+    # -- sorting -------------------------------------------------------------
+
+    def test_sort_by_distance_orders_nearest_first(self):
+        hc = self._crawl(deep_crawl=False, sort_by="distance")
+        known = [d for d in hc.distances if d is not None]
+        self.assertEqual(known, sorted(known))
+        self.assertGreater(len(known), 1)
+
+    def test_sort_by_rating_orders_best_first(self):
+        hc = self._crawl(deep_crawl=False, sort_by="rating")
+        vals = [float(r) if r != "unknown" else -1 for r in hc.ratings]
+        self.assertEqual(vals, sorted(vals, reverse=True))
+
+    def test_sort_by_popularity_orders_most_reviewed_first(self):
+        # deep_crawl=False: hidden-count rated cards must still be filled
+        # from the venue page (force fetch) before ranking.
+        hc = self._crawl(deep_crawl=False, sort_by="popularity")
+        counts = [int(r or 0) for r in hc.reviews]
+        self.assertEqual(counts, sorted(counts, reverse=True))
+        self.assertGreater(counts[0], 0)
+
+    def test_sort_stars_alias_and_bad_value(self):
+        self.assertEqual(HappyCowler._normalize_sort("stars"), "rating")
+        with self.assertRaises(Exception):
+            HappyCowler("https://example.test/", sort_by="bogus")
+
+    # -- filters --------------------------------------------------------------
+
+    def test_min_rating_filters_low_and_unrated(self):
+        hc = self._crawl(deep_crawl=False, min_rating=4.6)
+        self.assertTrue(hc.names)  # fixture has at least one 5.0 card
+        for r in hc.ratings:
+            self.assertNotEqual(r, "unknown")
+            self.assertGreaterEqual(float(r), 4.6)
+
+    def test_radius_filter_drops_far_venues(self):
+        near = self._crawl(deep_crawl=False, radius_miles=0.2)
+        everyone = self._crawl(deep_crawl=False)
+        self.assertLess(len(near.names), len(everyone.names))
+        for d in near.distances:
+            self.assertLessEqual(d, 0.2)
+
     def test_result_lists_are_equal_length(self):
         hc = self._crawl()
         n = len(hc.names)
@@ -345,7 +390,8 @@ class TestLiveHappyCow(unittest.TestCase):
                            "Expected at least one restaurant for Worms, Germany")
 
     def test_all_required_fields_present(self):
-        required = {"name", "type", "rating", "reviews", "address",
+        required = {"name", "type", "rating", "reviews", "distance_miles",
+                    "latitude", "longitude", "address",
                     "phone", "hours", "cuisine", "description"}
         for r in self._fetch(max_results=5):
             missing = required - set(r.keys())
