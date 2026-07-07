@@ -7,15 +7,14 @@ There are three test suites here:
   TestMCPSearchRestaurants   – unit tests; mock HappyCowler so no HTTP is
                                needed.  These always run.
 
-  TestSearchEndToEnd         – unit tests; run search_restaurants over the
-                               real parser against the bundled rendered-text
-                               fixture (only the Playwright fetch is mocked).
-                               Always run.
+  TestCrawlPipelineWithFixtures – unit tests; drive the full HappyCowler.crawl()
+                               pipeline with HTTP mocked, against captured
+                               HappyCow fixtures.  Always run.
 
   TestLiveHappyCow           – integration tests that hit happycow.net over
                                the network.  Skipped by default.  Enable with:
 
-                                   HAPPYCOW_RUN_LIVE_TESTS=1 python -m pytest tests/ -v
+                                   HAPPYCOW_RUN_LIVE_TESTS=1 python -m unittest discover -s tests
 
                                These are the definitive "does it work with the
                                current site?" check.
@@ -39,7 +38,6 @@ _SAMPLE_ENTRIES = [
         "name": "Green Heaven",
         "tag": "Vegan",
         "rating": "5.0",
-        "reviews": "16",
         "address": "10 Elm St, Worms, Germany",
         "phone": "+49 6241 12345",
         "hours": "Mon-Fri 11am-9pm",
@@ -85,7 +83,6 @@ def _make_mock_hc(entries):
     hc.names         = [e["name"]        for e in entries]
     hc.tags          = [e["tag"]         for e in entries]
     hc.ratings       = [e["rating"]      for e in entries]
-    hc.reviews       = [e.get("reviews", "") for e in entries]
     hc.addresses     = [e["address"]     for e in entries]
     hc.phone_numbers = [e["phone"]       for e in entries]
     hc.opening_hours = [e["hours"]       for e in entries]
@@ -117,7 +114,7 @@ class TestMCPSearchRestaurants(unittest.TestCase):
     def test_all_required_fields_present(self, MockHC):
         MockHC.return_value = _make_mock_hc(_SAMPLE_ENTRIES[:1])
         data = json.loads(search_restaurants("https://www.happycow.net/test/"))
-        required = {"name", "type", "rating", "reviews", "address", "phone",
+        required = {"name", "type", "rating", "address", "phone",
                     "hours", "cuisine", "description"}
         for field in required:
             self.assertIn(field, data[0], f"Missing field: {field}")
@@ -234,79 +231,82 @@ class TestMCPSearchRestaurants(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Suite 2: End-to-end through the real parser (only the browser fetch mocked)
+# Suite 2: Parser unit tests against the bundled HTML fixture
 # ---------------------------------------------------------------------------
 
 _DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_pages/")
 
 
-def _fixture_text():
-    with open(_DATA_PATH + "montrose_listing.txt", "r") as f:
-        return f.read()
+class TestCrawlPipelineWithFixtures(unittest.TestCase):
+    """Exercise the full HappyCowler.crawl() pipeline against captured HappyCow
+    fixtures, with all HTTP mocked. This is the regression baseline: if the
+    listing-fragment or review-page parsers break, these tests catch it.
 
-
-class TestSearchEndToEnd(unittest.TestCase):
-    """Run search_restaurants over the real HappyCowler + parser.
-
-    Only ``_render_text`` (the Playwright subprocess) is patched, so this
-    covers URL normalization, crawl(), parse_listing_text() and the JSON
-    shaping in one pass.
+    The mock reproduces HappyCow's three request stages:
+      1. city listing page   -> HTML containing the map seed lat/lng
+      2. /ajax/.../venues     -> JSON {"data": <listing fragment>}
+      3. /reviews/<slug>      -> venue detail page (schema.org microdata)
     """
 
-    def _search(self, **kwargs):
-        with patch("happycowler.happycowler._render_text",
-                   return_value=_fixture_text()):
-            return json.loads(
-                search_restaurants(
-                    "https://www.happycow.net/north_america/usa/montrose/",
-                    **kwargs,
-                )
-            )
+    @classmethod
+    def setUpClass(cls):
+        with open(_DATA_PATH + "lima_listing_fragment.html") as f:
+            cls.fragment = f.read()
+        with open(_DATA_PATH + "noqa_review_snippet.html") as f:
+            cls.review = f.read()
 
-    def test_returns_all_fixture_venues(self):
-        data = self._search()
-        self.assertEqual(
-            [r["name"] for r in data],
-            ["Pure Roots Cafe", "Green Sprout Kitchen", "Camp Robber",
-             "Natural Grocers"],
-        )
+    def _fake_http_get(self, session, url, xhr=False, as_json=False, timeout=30):
+        if as_json:  # the /ajax/.../venues endpoint
+            # page=1 returns the fragment; any later page returns nothing (stop)
+            data = self.fragment if "page=1&" in url or url.endswith("page=1") else ""
+            return {"data": data, "success": True}
+        if "/reviews/" in url:  # deep-crawl of a venue detail page
+            return self.review
+        # the city listing page: must contain a searchmap lat/lng link
+        return ('<html><body><a href="/searchmap?lat=-12.062106&amp;'
+                'lng=-77.036526">map</a></body></html>')
 
-    def test_vegan_filter(self):
-        data = self._search(type_filter="vegan")
-        self.assertEqual([r["name"] for r in data], ["Pure Roots Cafe"])
-        self.assertEqual(data[0]["rating"], "5.0")
-        self.assertEqual(data[0]["reviews"], "12")
-
-    def test_full_record_shape(self):
-        r = self._search()[1]  # Green Sprout Kitchen
-        self.assertEqual(r["type"],        "Vegetarian")
-        self.assertEqual(r["rating"],      "4.5")
-        self.assertEqual(r["reviews"],     "8")
-        self.assertEqual(r["address"],     "5 Oak Ave, Montrose, Colorado, USA")
-        self.assertEqual(r["phone"],       "")  # "Add a phone number" placeholder
-        self.assertEqual(r["hours"],       "Closed")
-        self.assertEqual(r["cuisine"],     "Vegetarian, Indian")
-
-    def test_hyphenated_region_url_accepted(self):
-        with patch("happycowler.happycowler._render_text",
-                   return_value=_fixture_text()) as mock_render:
-            search_restaurants(
-                "https://www.happycow.net/north-america/usa/montrose/")
-        fetched_url = mock_render.call_args[0][0]
-        self.assertIn("/north_america/", fetched_url)
-
-    def test_crawler_coordinates_placeholder(self):
-        with patch("happycowler.happycowler._render_text",
-                   return_value=_fixture_text()):
-            hc = HappyCowler("https://www.happycow.net/north_america/usa/montrose/")
+    def _crawl(self, **kwargs):
+        with patch("happycowler.happycowler._http_get", side_effect=self._fake_http_get):
+            hc = HappyCowler("https://www.happycow.net/south_america/peru/lima/",
+                             **kwargs)
             hc.crawl()
+        return hc
+
+    def test_collects_all_listing_venues(self):
+        hc = self._crawl(deep_crawl=False)
+        self.assertEqual(hc.names[:2], ["Chocotejas Veganas", "Noqa Vegan"])
+        self.assertEqual(len(hc.names), 5)
+
+    def test_coordinates_from_listing(self):
+        hc = self._crawl(deep_crawl=False)
+        for lat, lng in hc.coordinates:
+            self.assertTrue(lat and lng)
+
+    def test_deep_crawl_fills_detail_fields(self):
+        hc = self._crawl()
+        i = hc.names.index("Noqa Vegan")
+        self.assertEqual(hc.ratings[i], "5.0")
+        self.assertEqual(hc.phone_numbers[i], "+51-960550950")
+        self.assertEqual(hc.opening_hours[i], "Mon-Sun 10:00am-6:30pm")
+        self.assertIn("Lima", hc.addresses[i])
+
+    def test_type_filter_limits_to_vegan(self):
+        hc = self._crawl(type_filter="vegan", deep_crawl=False)
+        self.assertTrue(all("Vegan" in t for t in hc.tags))
+        self.assertIn("Noqa Vegan", hc.names)
+
+    def test_max_results_caps_before_deep_crawl(self):
+        hc = self._crawl(max_results=2, deep_crawl=False)
+        self.assertEqual(len(hc.names), 2)
+
+    def test_result_lists_are_equal_length(self):
+        hc = self._crawl()
         n = len(hc.names)
-        self.assertEqual(n, 4)
-        for attr in ("tags", "ratings", "reviews", "addresses", "phone_numbers",
-                     "opening_hours", "cuisines", "descriptions", "coordinates"):
-            self.assertEqual(len(getattr(hc, attr)), n)
-        for coord in hc.coordinates:
-            self.assertEqual(coord, ("", ""))
+        for col in (hc.tags, hc.ratings, hc.addresses, hc.phone_numbers,
+                    hc.opening_hours, hc.cuisines, hc.descriptions,
+                    hc.coordinates):
+            self.assertEqual(len(col), n)
 
 
 # ---------------------------------------------------------------------------
@@ -319,8 +319,8 @@ _LIVE = os.getenv("HAPPYCOW_RUN_LIVE_TESTS")
 class TestLiveHappyCow(unittest.TestCase):
     """Integration tests against the live happycow.net website.
 
-    These are the definitive check that the fetcher + parser still work with
-    HappyCow's *current* site.  They launch a real headless Chrome.
+    These are the definitive check that the HTML parsers still work with
+    HappyCow's *current* page structure.  They make real HTTP requests.
 
     Usage:
         HAPPYCOW_RUN_LIVE_TESTS=1 python -m pytest tests/test_mcp_server.py::TestLiveHappyCow -v
@@ -342,7 +342,7 @@ class TestLiveHappyCow(unittest.TestCase):
                            "Expected at least one restaurant for Worms, Germany")
 
     def test_all_required_fields_present(self):
-        required = {"name", "type", "rating", "reviews", "address",
+        required = {"name", "type", "rating", "address",
                     "phone", "hours", "cuisine", "description"}
         for r in self._fetch(max_results=5):
             missing = required - set(r.keys())
@@ -354,9 +354,7 @@ class TestLiveHappyCow(unittest.TestCase):
             self.assertTrue(r["name"].strip(), "Restaurant name should not be empty")
 
     def test_type_is_known_value(self):
-        valid = {"Vegan", "Vegetarian", "Veg-friendly", "Other", "Catering",
-                 "Health Food Store", "Cafe", "Bakery", "Food Truck",
-                 "Juice Bar", "Market", ""}
+        valid = {"Vegan", "Vegetarian", "Veg-friendly", "Other", "Catering", ""}
         for r in self._fetch(max_results=10):
             self.assertTrue(
                 any(t in r["type"] for t in valid),

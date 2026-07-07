@@ -31,7 +31,8 @@ def search_restaurants(
     HappyCow URL format:
         https://www.happycow.net/{region}/{country}/{city}/
 
-    Common region slugs:
+    Common region slugs (note: multi-word regions use an UNDERSCORE, not a
+    hyphen — e.g. south_america; a hyphen returns HTTP 404):
         europe, north_america, south_america, asia, africa, oceania, middle_east
 
     URL examples:
@@ -58,7 +59,6 @@ def search_restaurants(
           - name        (str): Restaurant name
           - type        (str): "Vegan", "Vegetarian", or "Veg-friendly"
           - rating      (str): Star rating like "4.5", "3.0", or "unknown"
-          - reviews     (str): Number of reviews (e.g. "16"), or "" if none
           - address     (str): Street address
           - phone       (str): Phone number
           - hours       (str): Opening hours summary
@@ -68,7 +68,8 @@ def search_restaurants(
         On error returns: {"error": "<message>"}
     """
     try:
-        hc = HappyCowler(city_url)
+        # Pass the filter/cap down so we only deep-crawl venues we'll return.
+        hc = HappyCowler(city_url, type_filter=type_filter, max_results=max_results)
         hc.crawl()
     except Exception as exc:
         return json.dumps({"error": str(exc)})
@@ -90,7 +91,6 @@ def search_restaurants(
             "name": _clean(hc.names[i]),
             "type": tag,
             "rating": hc.ratings[i],
-            "reviews": hc.reviews[i],
             "address": _clean(hc.addresses[i]),
             "phone": _clean(hc.phone_numbers[i]),
             "hours": _clean(hc.opening_hours[i]),

@@ -1,3 +1,19 @@
+Version 0.3.0: 2026-07-03
+  - Fixed: Crawler rewritten for HappyCow's current JavaScript-rendered site.
+    The old server-side listing markup (div.row.venue-list-item, the "(N)"
+    count in the <h1>) is gone; the parser now reads map coordinates from the
+    city page, pages through the /ajax/views/searchmap/venues JSON endpoint,
+    and reads schema.org microdata from each venue's review page. This fixes
+    the misleading "substring not found" error every query used to return.
+  - Fixed: Region slugs must use underscores (south_america), not hyphens.
+    Docs/examples corrected and 404s now return an explanatory message.
+  - Changed: Replaced the defunct incapsula-cracker-py3 dependency with
+    curl_cffi, which impersonates a browser TLS fingerprint to get past
+    HappyCow's Imperva/Incapsula protection.
+  - Changed: Deep-crawl of venue detail pages now runs concurrently and is
+    bounded by type_filter/max_results, so only returned venues are fetched.
+  - Changed: Unit-test fixtures refreshed to current HappyCow markup.
+
 Version 0.2.4: 2017-08-25
   - New: Functions as a module.
   - New: Unit tests added.

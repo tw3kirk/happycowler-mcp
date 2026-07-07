@@ -1,127 +1,99 @@
-# -*- coding: utf-8 -*-
-"""
-Unit tests for the HappyCow text parser (happycowler/happycowler.py).
-
-The 2026 rewrite fetches pages with headless Chrome and parses the rendered
-*visible text* rather than the (obfuscated, frequently-redesigned) HTML.
-These tests exercise ``parse_listing_text`` and ``normalize_url`` against a
-bundled rendered-text fixture; no network access is required.
-"""
 import os
 import unittest
 
-from happycowler.happycowler import normalize_url, parse_listing_text
+from happycowler.happycowler import (
+    classify_type,
+    extract_latlng,
+    parse_listing_fragment,
+    parse_venue_detail,
+    HappyCowError,
+)
 
-_DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_pages/")
-
-
-def _load_fixture():
-    with open(_DATA_PATH + "montrose_listing.txt", "r") as f:
-        return f.read()
-
-
-class TestNormalizeUrl(unittest.TestCase):
-
-    def test_hyphenated_region_fixed(self):
-        self.assertEqual(
-            normalize_url("https://www.happycow.net/north-america/usa/montrose/"),
-            "https://www.happycow.net/north_america/usa/montrose/",
-        )
-
-    def test_underscore_region_unchanged(self):
-        url = "https://www.happycow.net/north_america/usa/montrose/"
-        self.assertEqual(normalize_url(url), url)
-
-    def test_single_word_region_unchanged(self):
-        url = "https://www.happycow.net/europe/germany/worms/"
-        self.assertEqual(normalize_url(url), url)
+data_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         'test_pages/')
 
 
-class TestParseListingText(unittest.TestCase):
-    """Field-by-field regression baseline for the rendered-text parser."""
+class TypeClassification(unittest.TestCase):
+
+    def test_restaurant_buckets(self):
+        self.assertEqual(classify_type("vegan", "1", "1"), "Vegan")
+        self.assertEqual(classify_type("vegetarian", "0", "1"), "Vegetarian")
+        self.assertEqual(classify_type("veg-options", "0", "0"), "Veg-friendly")
+
+    def test_store_keeps_label_with_vegan_prefix(self):
+        # A fully-vegan delivery kitchen should still match a "Vegan" filter.
+        self.assertEqual(classify_type("Delivery", "1", "1"), "Vegan Delivery")
+        self.assertIn("Vegan", classify_type("Veg Store", "1", "1"))
+
+    def test_non_veg_store_unprefixed(self):
+        self.assertEqual(classify_type("Health Store", "0", "0"), "Health Store")
+
+
+class LatLngExtraction(unittest.TestCase):
+
+    def test_extracts_coordinates_with_escaped_amp(self):
+        html = '<a href="/searchmap?lat=-12.062106&amp;lng=-77.036526">map</a>'
+        self.assertEqual(extract_latlng(html), ("-12.062106", "-77.036526"))
+
+    def test_missing_coordinates_raises(self):
+        with self.assertRaises(HappyCowError):
+            extract_latlng("<html><body>no map here</body></html>")
+
+
+class ListingFragmentParser(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.venues = parse_listing_text(_load_fixture())
+        with open(data_path + "lima_listing_fragment.html") as f:
+            cls.venues = parse_listing_fragment(f.read())
 
-    def test_total_venue_count(self):
-        self.assertEqual(len(self.venues), 4)
+    def test_all_five_cards_parsed(self):
+        self.assertEqual(len(self.venues), 5)
 
-    def test_names(self):
-        self.assertEqual(
-            [v["name"] for v in self.venues],
-            ["Pure Roots Cafe", "Green Sprout Kitchen", "Camp Robber",
-             "Natural Grocers"],
-        )
+    def test_names_and_urls(self):
+        first = self.venues[0]
+        self.assertEqual(first["name"], "Chocotejas Veganas")
+        self.assertTrue(first["url"].startswith("https://www.happycow.net/reviews/"))
 
-    def test_types_normalized(self):
-        self.assertEqual(
-            [v["type"] for v in self.venues],
-            ["Vegan", "Vegetarian", "Veg-friendly", "Health Food Store"],
-        )
-
-    def test_ratings(self):
-        self.assertEqual(
-            [v["rating"] for v in self.venues],
-            ["5.0", "4.5", "unknown", "4.0"],
-        )
-
-    def test_review_counts(self):
-        self.assertEqual(
-            [v["reviews"] for v in self.venues],
-            ["12", "8", "", ""],
-        )
-
-    def test_addresses(self):
-        self.assertEqual(
-            [v["address"] for v in self.venues],
-            [
-                "123 Main St, Montrose, Colorado, USA",
-                "5 Oak Ave, Montrose, Colorado, USA",
-                "1515 Ogden Rd, Montrose, Colorado, USA",
-                "3151 Woodgate Rd, Montrose, Colorado, USA",
-            ],
-        )
-
-    def test_phone_numbers(self):
-        # "Add a phone number" placeholder must come through as empty
-        self.assertEqual(
-            [v["phone"] for v in self.venues],
-            ["970-555-0101", "", "970-240-1590", "970-555-0199"],
-        )
-
-    def test_hours_status(self):
-        self.assertEqual(
-            [v["hours"] for v in self.venues],
-            ["Open Now", "Closed", "", "Open Now"],
-        )
-
-    def test_cuisines(self):
-        self.assertEqual(
-            [v["cuisine"] for v in self.venues],
-            ["Vegan, Cafe", "Vegetarian, Indian", "Southwestern, American", ""],
-        )
-
-    def test_descriptions(self):
-        self.assertEqual(
-            [v["description"] for v in self.venues],
-            [
-                "All-vegan cafe with soups and grain bowls.",
-                "Vegetarian kitchen with vegan options; daal and curry.",
-                "Southwestern restaurant with some vegan-friendly dishes.",
-                "Health food store with organic produce and bulk foods.",
-            ],
-        )
-
-    def test_all_records_have_all_fields(self):
-        required = {"name", "type", "rating", "reviews", "address", "phone",
-                    "hours", "cuisine", "description"}
+    def test_coordinates_present(self):
         for v in self.venues:
-            self.assertEqual(required - set(v.keys()), set())
+            lat, lng = v["coordinates"]
+            self.assertTrue(lat and lng)
+            float(lat)
+            float(lng)  # parseable
 
-    def test_empty_text_yields_no_venues(self):
-        self.assertEqual(parse_listing_text(""), [])
+    def test_types_mapped(self):
+        by_name = {v["name"]: v["tag"] for v in self.venues}
+        self.assertEqual(by_name["Noqa Vegan"], "Vegan")
+        self.assertEqual(by_name["ConSuLado Vegano"], "Vegan")
 
 
-if __name__ == "__main__":
+class VenueDetailParser(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        with open(data_path + "noqa_review_snippet.html") as f:
+            cls.detail = parse_venue_detail(f.read())
+
+    def test_rating_normalised(self):
+        self.assertEqual(self.detail["rating"], "5.0")
+
+    def test_address_composed_from_parts(self):
+        self.assertEqual(self.detail["address"],
+                         "Av Paseo de la República, Lima, Peru")
+
+    def test_phone(self):
+        self.assertEqual(self.detail["phone"], "+51-960550950")
+
+    def test_hours_stripped(self):
+        self.assertEqual(self.detail["hours"], "Mon-Sun 10:00am-6:30pm")
+
+    def test_description(self):
+        self.assertTrue(self.detail["description"].startswith("Vegan restaurant"))
+
+    def test_missing_rating_is_unknown(self):
+        self.assertEqual(parse_venue_detail("<html></html>")["rating"], "unknown")
+
+
+if __name__ == '__main__':
     unittest.main()
