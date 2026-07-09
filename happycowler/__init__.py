@@ -3,7 +3,7 @@
 HappyCowler is a crawler and parser for extracting geospatial data from `HappyCow.net <https://happycow.net/>`_ that liberates vegans and vegetarians from having to access the Internet while looking for a restaurant.
 
 """
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 from .happycowler import HappyCowler, HappyCowError
 
 __all__ = ['HappyCowler', 'HappyCowError']

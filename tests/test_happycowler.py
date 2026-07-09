@@ -5,8 +5,11 @@ from unittest.mock import patch
 
 from happycowler import happycowler as hc_mod
 from happycowler.happycowler import (
+    HappyCowler,
     classify_type,
     extract_latlng,
+    is_open_at,
+    parse_hours,
     parse_listing_fragment,
     parse_venue_detail,
     HappyCowError,
@@ -158,6 +161,84 @@ class VenueDetailParser(unittest.TestCase):
 
     def test_missing_review_count_is_empty(self):
         self.assertEqual(parse_venue_detail("<html></html>")["reviews"], "")
+
+    def test_cuisines_and_categories_from_pills(self):
+        self.assertEqual(self.detail["cuisines"], ["Latin"])
+        self.assertEqual(self.detail["categories"], ["Take-out", "Gluten-free"])
+        self.assertEqual(self.detail["cuisine"], "Latin")  # legacy join
+
+    def test_features_from_li_titles(self):
+        self.assertEqual(self.detail["features"],
+                         ["Accepts credit cards", "Outdoor seating", "Wi-Fi"])
+
+    def test_price_from_microdata(self):
+        self.assertEqual(self.detail["price"], 2)  # "Moderate"
+
+
+class CardPriceAndTop(unittest.TestCase):
+    """Price level (filled $ icons) and Top Rated flag from listing cards."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(data_path + "lima_listing_fragment.html") as f:
+            cls.by_name = {v["name"]: v for v in parse_listing_fragment(f.read())}
+
+    def test_price_levels(self):
+        self.assertEqual(self.by_name["Noqa Vegan"]["price"], 2)
+        self.assertEqual(self.by_name["ConSuLado Vegano"]["price"], 1)
+        self.assertEqual(self.by_name["Chocotejas Veganas"]["price"], 0)
+
+    def test_top_rated_flag(self):
+        self.assertTrue(self.by_name["Noqa Vegan"]["top"])
+        self.assertFalse(self.by_name["ConSuLado Vegano"]["top"])
+
+
+class OpeningHours(unittest.TestCase):
+
+    SUMMARY = "Mon-Thu 12:00pm-9:00pm, Fri-Sat 12:00pm-9:30pm, Sun 12:00pm-9:00pm"
+
+    def test_parse_simple_range(self):
+        spans = parse_hours("Mon-Sun 10:00am-6:30pm")
+        self.assertEqual(len(spans), 7)
+        self.assertIn((0, 600, 1110), spans)
+
+    def test_parse_multi_segment(self):
+        spans = parse_hours(self.SUMMARY)
+        self.assertIn((0, 720, 1260), spans)   # Mon 12pm-9pm
+        self.assertIn((5, 720, 1290), spans)   # Sat 12pm-9:30pm
+        self.assertIn((6, 720, 1260), spans)   # Sun
+
+    def test_open_at(self):
+        self.assertTrue(is_open_at(self.SUMMARY, 0, 13 * 60))    # Mon 1pm
+        self.assertFalse(is_open_at(self.SUMMARY, 0, 11 * 60))   # Mon 11am
+        self.assertFalse(is_open_at(self.SUMMARY, 0, 21 * 60 + 30))  # Mon 9:30pm
+        self.assertTrue(is_open_at(self.SUMMARY, 5, 21 * 60 + 15))   # Sat 9:15pm
+
+    def test_overnight_spill(self):
+        # Fri 6pm-2am: open Fri 11pm and Sat 1am, closed Sat 3am
+        s = "Fri 6:00pm-2:00am"
+        self.assertTrue(is_open_at(s, 4, 23 * 60))
+        self.assertTrue(is_open_at(s, 5, 60))
+        self.assertFalse(is_open_at(s, 5, 180))
+
+    def test_midnight_close(self):
+        s = "Mon-Sun 11:00am-12:00am"
+        self.assertTrue(is_open_at(s, 2, 23 * 60 + 30))
+
+    def test_unparseable_is_none(self):
+        self.assertIsNone(is_open_at("Call for hours", 0, 600))
+        self.assertIsNone(is_open_at("", 0, 600))
+
+    def test_day_wrap_range(self):
+        spans = parse_hours("Sat-Sun 9:00am-5:00pm")
+        self.assertEqual({d for d, _, _ in spans}, {5, 6})
+
+    def test_parse_at_variants(self):
+        self.assertEqual(HappyCowler._parse_at("Sat 19:30"), (5, 1170))
+        self.assertEqual(HappyCowler._parse_at("sat 7:30pm"), (5, 1170))
+        self.assertEqual(HappyCowler._parse_at("Sunday 11am"), (6, 660))
+        with self.assertRaises(HappyCowError):
+            HappyCowler._parse_at("someday 25:99")
 
 
 if __name__ == '__main__':

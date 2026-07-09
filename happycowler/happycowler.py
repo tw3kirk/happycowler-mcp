@@ -233,6 +233,44 @@ _CARD_RATING_RE = re.compile(r"^[0-5](\.\d)?$")
 _CARD_COUNT_RE = re.compile(r"^\((\d+)\)$")
 
 
+def _norm_token(text):
+    """Normalize a label for matching: lowercase, alphanumerics only."""
+    return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
+
+
+# The cuisine and category vocabularies HappyCow uses (venue pages show them
+# as tag pills in .venue-info). Stored normalized via _norm_token.
+CUISINES = {_norm_token(c) for c in (
+    "African", "American", "Asian", "Australian", "Brazilian", "British",
+    "Caribbean", "Chinese", "European", "French", "Fusion", "German",
+    "Indian", "International", "Italian", "Japanese", "Korean", "Latin",
+    "Mediterranean", "Mexican", "Middle Eastern", "Spanish", "Taiwanese",
+    "Thai", "Vietnamese", "Western",
+)}
+CATEGORIES = {_norm_token(c) for c in (
+    "Delivery", "Take-out", "Breakfast", "Gluten-free", "Organic", "Pizza",
+    "Bakery", "Beer/Wine", "Buffet", "Catering", "Fast food", "Juice Bar",
+    "Macrobiotic", "Raw food", "Salad Bar", "Kosher",
+)}
+_VEG_LEVEL_PILLS = {_norm_token(c) for c in (
+    "Vegan", "Vegetarian", "Vegan-friendly", "Veg-friendly", "Vegan Options",
+)}
+
+# For reference: the /ajax/views/searchmap/venues endpoint also accepts
+# server-side narrowing via &filters=<slug> (single value; unknown slugs are
+# silently ignored) and &radius=<miles>. Verified working slugs: vegan,
+# vegetarian, veg-options, bakery, coffee-tea, health-store, delivery,
+# catering, bnb, farmers-market, organization, spa, other, icecream,
+# juicebar, foodtruck, vegshop, marketvendor. The crawler filters
+# client-side instead so one cached base crawl serves every combination.
+
+
+def _card_price(card):
+    """Price level 0-3 from a card's dollar icons (yellow = filled)."""
+    return sum(1 for svg in card.select(".price-range-item")
+               if "text-yellow-500" in (svg.get("class") or []))
+
+
 def _card_rating(card):
     """Read the rating and review count shown on a listing card."""
     for div in card.find_all("div"):
@@ -281,6 +319,8 @@ def parse_listing_fragment(fragment_html):
             "coordinates": coords,
             "rating": rating,
             "reviews": reviews,
+            "price": _card_price(card),
+            "top": (details.get("data-top") == "1") if details else False,
         })
     return venues
 
@@ -303,9 +343,76 @@ def _microdata(soup, prop):
     return (el.get("content") or el.get_text(" ", strip=True)).strip()
 
 
+# --- opening-hours parsing (for the open-now filter) -----------------------
+
+_DAY_INDEX = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4,
+              "sat": 5, "sun": 6}
+_HOURS_SEG_RE = re.compile(r"([A-Za-z]{3})(?:-([A-Za-z]{3}))?\s+(.+)")
+_TIME_RANGE_RE = re.compile(
+    r"(\d{1,2})(?::(\d{2}))?(am|pm)-(\d{1,2})(?::(\d{2}))?(am|pm)", re.I)
+
+
+def _to_minutes(hour, minute, ampm):
+    hour, minute = int(hour), int(minute or 0)
+    if ampm.lower() == "pm" and hour != 12:
+        hour += 12
+    if ampm.lower() == "am" and hour == 12:
+        hour = 0
+    return hour * 60 + minute
+
+
+def parse_hours(summary):
+    """Parse an hours summary like ``Mon-Thu 12:00pm-9:00pm, Sun 12:00pm-9:00pm``
+    into (day_index 0=Mon, open_minute, close_minute) tuples. Close times past
+    midnight exceed 1440. Returns [] when nothing parses."""
+    spans = []
+    for seg in (summary or "").split(","):
+        seg = seg.strip()
+        if not seg:
+            continue
+        if "24 h" in seg.lower() or "24 hours" in seg.lower():
+            for d in range(7):
+                spans.append((d, 0, 1440))
+            continue
+        m = _HOURS_SEG_RE.match(seg)
+        if not m:
+            continue
+        d1 = _DAY_INDEX.get(m.group(1).lower()[:3])
+        d2 = _DAY_INDEX.get((m.group(2) or m.group(1)).lower()[:3])
+        if d1 is None or d2 is None:
+            continue
+        days = [(d1 + i) % 7 for i in range((d2 - d1) % 7 + 1)]
+        for t in _TIME_RANGE_RE.finditer(m.group(3)):
+            start = _to_minutes(t.group(1), t.group(2), t.group(3))
+            end = _to_minutes(t.group(4), t.group(5), t.group(6))
+            if end <= start:
+                end += 1440  # closes after midnight (or 12:00am close)
+            for d in days:
+                spans.append((d, start, end))
+    return spans
+
+
+def is_open_at(summary, weekday, minute):
+    """Is a venue with this hours summary open at (weekday 0=Mon, minute)?
+    Returns None when the hours can't be parsed (unknown)."""
+    spans = parse_hours(summary)
+    if not spans:
+        return None
+    for d, start, end in spans:
+        if d == weekday and start <= minute < min(end, 1440):
+            return True
+        if end > 1440 and (d + 1) % 7 == weekday and minute < end - 1440:
+            return True  # overnight spill past midnight
+    return False
+
+
+_PRICE_RANGE_WORDS = {"inexpensive": 1, "moderate": 2, "expensive": 3}
+
+
 def parse_venue_detail(review_html):
-    """Parse a venue review page. Returns a dict with keys:
-    rating, address, phone, hours, cuisine, description."""
+    """Parse a venue review page. Returns a dict with keys: rating, reviews,
+    address, phone, hours, cuisine, cuisines, categories, features, price,
+    description."""
     soup = BeautifulSoup(review_html, "html.parser")
 
     rating_value = _microdata(soup, "ratingValue")
@@ -324,21 +431,51 @@ def parse_venue_detail(review_html):
     if hours_el:
         hours = re.sub(r"^Open\s+", "", hours_el.get_text(" ", strip=True)).rstrip(".")
 
+    # Tag pills in .venue-info: veg level, then cuisines and categories
+    # (the last pill is the description blob — filtered out by length).
+    cuisines, categories = [], []
+    info = soup.select_one(".venue-info")
+    if info is not None:
+        for pill in info.find_all("div", recursive=False):
+            text = pill.get_text(strip=True)
+            token = _norm_token(text)
+            if not text or len(text) > 40 or token in _VEG_LEVEL_PILLS:
+                continue
+            if token in CUISINES:
+                cuisines.append(text)
+            elif token in CATEGORIES:
+                categories.append(text)
+
+    # Feature list items carry their label in a title attribute
+    # (e.g. <li title="Accepts credit cards">).
+    features = []
+    for li in soup.find_all("li", title=True):
+        title = li["title"].strip()
+        if title and title not in features and len(title) < 40:
+            features.append(title)
+
+    price = _PRICE_RANGE_WORDS.get(
+        _microdata(soup, "priceRange").lower(), 0)
+
     return {
         "rating": rating,
         "reviews": _microdata(soup, "reviewCount"),
         "address": address,
         "phone": _microdata(soup, "telephone"),
         "hours": hours,
-        # HappyCow no longer exposes a discrete cuisine field on listings.
-        "cuisine": "",
+        "cuisine": ", ".join(cuisines),
+        "cuisines": cuisines,
+        "categories": categories,
+        "features": features,
+        "price": price,
         "description": _microdata(soup, "description"),
     }
 
 
 _EMPTY_DETAIL = {
     "rating": "unknown", "reviews": "", "address": "", "phone": "",
-    "hours": "", "cuisine": "", "description": "",
+    "hours": "", "cuisine": "", "cuisines": [], "categories": [],
+    "features": [], "price": 0, "description": "",
 }
 
 
@@ -373,11 +510,22 @@ class HappyCowler(object):
     :param session: Optional pre-built ``requests.Session``.
     """
 
-    SORTS = ("default", "distance", "rating", "popularity")
+    SORTS = ("default", "distance", "rating", "popularity", "name", "veg",
+             "price_asc", "price_desc")
+    _SORT_ALIASES = {
+        "stars": "rating", "most popular": "popularity", "a-z": "name",
+        "az": "name", "alphabetical": "name", "veg friendliness": "veg",
+        "veg-friendliness": "veg", "price": "price_asc",
+        "price-asc": "price_asc", "price-desc": "price_desc",
+        "cheapest": "price_asc", "priciest": "price_desc",
+    }
 
     def __init__(self, city_url, target_file=None, verbose=0, type_filter=None,
                  max_results=None, deep_crawl=True, sort_by=None,
                  min_rating=None, radius_miles=None, refresh=False,
+                 venue_types=None, cuisines=None, categories=None,
+                 features=None, vegan_only=False, hide_chains=False,
+                 open_now=False, at=None, detail_scan_limit=80,
                  max_pages=25, workers=8, request_delay=0.0, session=None):
         self.refresh = bool(refresh)
         self.city_url = city_url if isinstance(city_url, list) else [city_url]
@@ -389,23 +537,38 @@ class HappyCowler(object):
         self.sort_by = self._normalize_sort(sort_by)
         self.min_rating = float(min_rating) if min_rating else None
         self.radius_miles = float(radius_miles) if radius_miles else None
+        self.venue_types = self._csv_tokens(venue_types)
+        self.cuisines = self._csv_tokens(cuisines)
+        self.categories = self._csv_tokens(categories)
+        self.features = self._csv_tokens(features)
+        self.vegan_only = bool(vegan_only)
+        self.hide_chains = bool(hide_chains)
+        self.open_now = bool(open_now)
+        self.at = self._parse_at(at)
+        self.detail_scan_limit = detail_scan_limit
         self.max_pages = max_pages
         self.workers = max(1, workers)
         self.request_delay = request_delay
         self.session = session or _new_session()
         self._detail_cache = {}
+        self.scan_truncated = False
 
-        # Public result columns (kept for backwards compatibility).
+        # Public result columns (kept for backwards compatibility; the
+        # `cuisines` constructor arg is a filter, the result column of the
+        # same concept is `venue_cuisines`).
         self.coordinates = []
         self.names = []
         self.tags = []
         self.ratings = []
         self.reviews = []
         self.distances = []
+        self.prices = []
+        self.venue_cuisines = []
+        self.venue_categories = []
+        self.venue_features = []
         self.addresses = []
         self.phone_numbers = []
         self.opening_hours = []
-        self.cuisines = []
         self.descriptions = []
         self.total_entries = 0
         self.processed_entries = 0
@@ -418,23 +581,55 @@ class HappyCowler(object):
             "vegan": "Vegan",
             "vegetarian": "Vegetarian",
             "veg-friendly": "Veg-friendly",
+            "vegan options": "Veg-friendly",
+            "veg-options": "Veg-friendly",
         }.get(type_filter.lower())
 
     @classmethod
     def _normalize_sort(cls, sort_by):
         if not sort_by or sort_by == "default":
             return None
-        key = str(sort_by).lower().replace("stars", "rating")
+        key = str(sort_by).lower().strip()
+        key = cls._SORT_ALIASES.get(key, key)
         if key not in cls.SORTS:
             raise HappyCowError(
-                "Unknown sort_by {!r}; expected one of {}."
-                .format(sort_by, ", ".join(cls.SORTS)))
-        return key
+                "Unknown sort_by {!r}; expected one of {} (aliases: {})."
+                .format(sort_by, ", ".join(cls.SORTS),
+                        ", ".join(sorted(cls._SORT_ALIASES))))
+        return None if key == "default" else key
+
+    @staticmethod
+    def _csv_tokens(value):
+        """Accept a CSV string or a list; return normalized match tokens."""
+        if not value:
+            return []
+        items = value.split(",") if isinstance(value, str) else list(value)
+        return [t for t in (_norm_token(i) for i in items) if t]
+
+    @staticmethod
+    def _parse_at(at):
+        """Parse 'Sat 19:30' / 'sat 7:30pm' into (weekday, minute), or None."""
+        if not at:
+            return None
+        m = re.match(
+            r"\s*([A-Za-z]{3})[a-z]*[\s,]+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*$",
+            str(at), re.I)
+        if not m or m.group(1).lower()[:3] not in _DAY_INDEX:
+            raise HappyCowError(
+                "Could not parse at={!r}; expected e.g. 'Sat 19:30' or "
+                "'Sat 7:30pm'.".format(at))
+        hour, minute = int(m.group(2)), int(m.group(3) or 0)
+        if m.group(4):
+            return (_DAY_INDEX[m.group(1).lower()[:3]],
+                    _to_minutes(hour, minute, m.group(4)))
+        return (_DAY_INDEX[m.group(1).lower()[:3]], hour * 60 + minute)
 
     def _collect_listings(self, city_url):
         if not self.refresh:
             cached = _cache_read("listing", city_url)
-            if cached is not None:
+            # Listings cached before the price/top fields existed can't
+            # serve price sorts — treat them as a miss.
+            if cached is not None and all("price" in v for v in cached[:1]):
                 # JSON round-trip turns coordinate tuples into lists.
                 return [dict(v, coordinates=tuple(v["coordinates"]))
                         for v in cached]
@@ -471,7 +666,14 @@ class HappyCowler(object):
     # challenge page (a 200 with no microdata) instead of data.
     CHALLENGE_BACKOFF = 5.0
 
-    def _fetch_detail(self, venue, force=False):
+    def _fetch_detail(self, venue, force=False, fast=False):
+        """Fetch (and cache) a venue's detail page.
+
+        ``fast=True`` is the detail-scan mode: one attempt, no challenge
+        backoff — a WAF-challenged venue is skipped cheaply and stays
+        uncached so a later pass can pick it up. After several consecutive
+        challenges the HTTP session is rotated (fresh TLS fingerprint +
+        cookies), which usually clears the challenge streak."""
         if not (self.deep_crawl or force):
             return dict(_EMPTY_DETAIL)
         url = venue["url"]
@@ -479,7 +681,9 @@ class HappyCowler(object):
             return self._detail_cache[url]
         if not self.refresh:
             cached = _cache_read("venue", url)
-            if cached is not None:
+            # Entries written before the cuisines/categories/features/price
+            # fields existed can't serve those filters — treat as a miss.
+            if cached is not None and "cuisines" in cached:
                 self._detail_cache[url] = cached
                 return cached
         for attempt in (1, 2):
@@ -488,9 +692,16 @@ class HappyCowler(object):
             except (HappyCowError, RequestException):
                 detail = dict(_EMPTY_DETAIL)
             if detail != _EMPTY_DETAIL:
+                self._challenge_streak = 0
                 self._detail_cache[url] = detail
                 _cache_write("venue", url, detail)
                 return detail
+            self._challenge_streak = getattr(self, "_challenge_streak", 0) + 1
+            if self._challenge_streak >= 5:
+                self.session = _new_session()  # rotate identity
+                self._challenge_streak = 0
+            if fast:
+                break
             if attempt == 1:
                 time.sleep(self.CHALLENGE_BACKOFF)  # let the WAF cool off
         return dict(_EMPTY_DETAIL)  # never cache failures
@@ -502,9 +713,33 @@ class HappyCowler(object):
         except ValueError:
             return None
 
+    @staticmethod
+    def _chain_names(listings):
+        """Names of non-veg businesses with 3+ locations in this listing
+        (the app's 'Hide Chains' definition). Branch suffixes after ' - '
+        are ignored when grouping."""
+        from collections import Counter
+        base = lambda v: _norm_token(v["name"].split(" - ")[0])
+        counts = Counter(base(v) for v in listings)
+        return {base(v) for v in listings
+                if counts[base(v)] >= 3 and v["tag"] == "Veg-friendly"}
+
     def _apply_filters(self, listings):
         if self.type_filter:
-            listings = [v for v in listings if self.type_filter in v["tag"]]
+            # Exact match: the app's restaurant veg-type chips. Vegan stores
+            # and food trucks are venue_types/vegan_only territory.
+            listings = [v for v in listings if v["tag"] == self.type_filter]
+        if self.venue_types:
+            listings = [v for v in listings
+                        if any(t in _norm_token(v["tag"]) or
+                               _norm_token(v["tag"]).endswith(t)
+                               for t in self.venue_types)]
+        if self.vegan_only:
+            listings = [v for v in listings if v["tag"].startswith("Vegan")]
+        if self.hide_chains:
+            chains = self._chain_names(listings)
+            listings = [v for v in listings
+                        if _norm_token(v["name"].split(" - ")[0]) not in chains]
         if self.radius_miles:
             listings = [v for v in listings
                         if v["distance_miles"] is not None
@@ -522,6 +757,17 @@ class HappyCowler(object):
         if self.sort_by == "rating":
             return sorted(listings, key=lambda v: (
                 -(self._rating_value(v) or -1), -int(v["reviews"] or 0)))
+        if self.sort_by == "name":
+            return sorted(listings, key=lambda v: v["name"].lower())
+        if self.sort_by == "veg":
+            rank = {"Vegan": 0, "Vegetarian": 1, "Veg-friendly": 2}
+            return sorted(listings, key=lambda v: (
+                rank.get(v["tag"], 1 if v["tag"].startswith("Vegan") else 3),
+                -(self._rating_value(v) or -1)))
+        if self.sort_by in ("price_asc", "price_desc"):
+            sign = 1 if self.sort_by == "price_asc" else -1
+            return sorted(listings, key=lambda v: (
+                v.get("price", 0) == 0, sign * v.get("price", 0)))
         if self.sort_by == "popularity":
             # "Top Rated" cards hide their review count; fill those (and only
             # those) from the venue page's reviewCount before ranking.
@@ -531,6 +777,51 @@ class HappyCowler(object):
                     v["reviews"] = detail["reviews"] or v["reviews"]
             return sorted(listings, key=lambda v: -int(v["reviews"] or 0))
         return listings
+
+    def _detail_predicates(self):
+        """Predicates that need the venue detail page. Each takes a detail
+        dict and returns True/False."""
+        preds = []
+        if self.cuisines:
+            preds.append(lambda d: any(
+                t in {_norm_token(c) for c in d["cuisines"]}
+                for t in self.cuisines))
+        if self.categories:
+            preds.append(lambda d: any(
+                t in {_norm_token(c) for c in d["categories"]}
+                for t in self.categories))
+        if self.features:
+            preds.append(lambda d: all(
+                any(t in _norm_token(f) for f in d["features"])
+                for t in self.features))
+        if self.open_now or self.at:
+            if self.at:
+                weekday, minute = self.at
+            else:
+                now = time.localtime()
+                weekday, minute = now.tm_wday, now.tm_hour * 60 + now.tm_min
+            preds.append(
+                lambda d: is_open_at(d["hours"], weekday, minute) is True)
+        return preds
+
+    def _detail_scan(self, listings, preds):
+        """Walk the (sorted) listings fetching details until max_results
+        venues satisfy every detail predicate. Bounded by detail_scan_limit
+        so a rare filter in a huge city can't scan forever."""
+        wanted = self.max_results if self.max_results is not None else len(listings)
+        matched, scanned = [], 0
+        for v in listings:
+            if len(matched) >= wanted or scanned >= self.detail_scan_limit:
+                break
+            scanned += 1
+            detail = self._fetch_detail(v, force=True, fast=True)
+            if detail == _EMPTY_DETAIL:
+                continue  # challenged/blocked: skip cheaply, stays uncached
+            if all(p(detail) for p in preds):
+                matched.append(v)
+        self.scan_truncated = (scanned >= self.detail_scan_limit
+                               and len(matched) < wanted)
+        return matched
 
     def _store(self, listings):
         if self.deep_crawl and len(listings) > 1:
@@ -551,12 +842,16 @@ class HappyCowler(object):
             names.append(normalize(venue["name"]))
             tags.append(normalize(venue["tag"]))
             # Prefer detail-page values; fall back to the listing card's own
-            # rating/count (covers deep_crawl=False and blocked detail fetches).
+            # rating/count/price (covers deep_crawl=False and blocked fetches).
             rating = detail["rating"]
             if rating == "unknown":
                 rating = venue.get("rating", "unknown")
             ratings.append(rating)
             reviews.append(detail["reviews"] or venue.get("reviews", ""))
+            self.prices.append(detail["price"] or venue.get("price", 0))
+            self.venue_cuisines.append(list(detail["cuisines"]))
+            self.venue_categories.append(list(detail["categories"]))
+            self.venue_features.append(list(detail["features"]))
             addresses.append(normalize(detail["address"]))
             phones.append(normalize(detail["phone"]))
             hours.append(normalize(detail["hours"]))
@@ -577,7 +872,6 @@ class HappyCowler(object):
         self.addresses += addresses
         self.phone_numbers += phones
         self.opening_hours += hours
-        self.cuisines += cuisines
         self.descriptions += descriptions
 
     def crawl(self):
@@ -590,7 +884,10 @@ class HappyCowler(object):
             listings = self._apply_filters(self._collect_listings(city_url))
             self.total_entries += len(listings)
             listings = self._apply_sort(listings)
-            if self.max_results is not None:
+            preds = self._detail_predicates()
+            if preds:
+                listings = self._detail_scan(listings, preds)
+            elif self.max_results is not None:
                 listings = listings[:self.max_results]
             self._store(listings)
         if self.target_file is not None:

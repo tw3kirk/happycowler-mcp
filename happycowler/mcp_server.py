@@ -25,15 +25,24 @@ def search_restaurants(
     sort_by: str = "default",
     min_rating: float = 0,
     radius_miles: float = 0,
+    venue_types: str = "",
+    cuisines: str = "",
+    categories: str = "",
+    features: str = "",
+    vegan_only: bool = False,
+    hide_chains: bool = False,
+    open_now: bool = False,
+    at: str = "",
     refresh: bool = False,
 ) -> str:
-    """Search for vegan and vegetarian restaurants on HappyCow.net for a given city.
+    """Search vegan/vegetarian venues on HappyCow.net for a given city, with
+    the full set of app-style sorts and filters.
 
-    Crawls the HappyCow city listing page and returns structured restaurant data
-    including name, type, rating, review count, distance, address, phone, hours,
-    and description. Supports sorting (distance / rating / popularity) and
-    filtering (type / minimum stars / radius); sorting and filtering happen
-    before max_results, so "top N by X" queries work as expected.
+    Sorting and filtering happen before max_results, so "top N by X" works.
+    The first query for a city crawls it (slow, ~1 request/second politeness
+    throttle); everything after runs from a 24h local cache and is fast.
+    Filters marked [detail] below need venue pages: the first such query
+    fetches them progressively (bounded scan) and caches them too.
 
     HappyCow URL format:
         https://www.happycow.net/{region}/{country}/{city}/
@@ -66,10 +75,43 @@ def search_restaurants(
             "distance"    - nearest to the city center first
             "rating"      - highest star rating first (ties: more reviews first)
             "popularity"  - most-reviewed first
+            "name"        - alphabetical A->Z
+            "veg"         - veg-friendliness: Vegan, then Vegetarian, then
+                            veg-options (ties: rating)
+            "price_asc" / "price_desc" - cheapest / priciest first ($..$$$;
+                            venues without price info sort last)
         min_rating: Only return venues rated at least this many stars
             (e.g. 4.0). Unrated venues are dropped. 0 disables (default).
         radius_miles: Only return venues within this many miles of the city
             center (e.g. 50). 0 disables (default).
+        venue_types: CSV of place types (default: restaurants and everything
+            else). Values: restaurant veg-levels come from type_filter; here
+            use e.g. "bakery", "coffee & tea", "ice cream", "juice bar",
+            "food truck", "health store", "veg store", "delivery",
+            "catering", "b&b", "farmers market", "market vendor",
+            "organization", "spa", "other".
+        cuisines: [detail] CSV of cuisines, e.g. "korean, thai, italian".
+            Any listed cuisine matches. Full vocabulary: African, American,
+            Asian, Australian, Brazilian, British, Caribbean, Chinese,
+            European, French, Fusion, German, Indian, International, Italian,
+            Japanese, Korean, Latin, Mediterranean, Mexican, Middle Eastern,
+            Spanish, Taiwanese, Thai, Vietnamese, Western.
+        categories: [detail] CSV of categories; any listed one matches.
+            Vocabulary: Delivery, Take-out, Breakfast, Gluten-free, Organic,
+            Pizza, Bakery, Beer/Wine, Buffet, Catering, Fast food, Juice Bar,
+            Macrobiotic, Raw food, Salad Bar, Kosher.
+        features: [detail] CSV; venue must have ALL listed features.
+            Vocabulary: outdoor seating, reservation, wheelchair,
+            credit cards, wi-fi.
+        vegan_only: Only fully-vegan places (applies to stores/bakeries/etc.
+            as well as restaurants — the app's "only show vegan places").
+        hide_chains: Drop non-veg businesses with 3+ locations in this city
+            (the app's "Hide Chains").
+        open_now: [detail] Only venues open right now (uses this machine's
+            local clock — accurate when searching your own timezone).
+        at: [detail] Like open_now but for a specific local time, e.g.
+            "Sat 19:30" or "Sun 11am". Venues with unparseable hours are
+            treated as closed.
         refresh: Force a fresh crawl. By default results come from a local
             cache when the same city was crawled within the last 24 hours
             (sorts/filters still apply — they run on the cached data).
@@ -79,18 +121,24 @@ def search_restaurants(
     Returns:
         JSON array of restaurant objects. Each object contains:
           - name           (str): Restaurant name
-          - type           (str): "Vegan", "Vegetarian", or "Veg-friendly"
+          - type           (str): "Vegan", "Vegetarian", "Veg-friendly", or a
+                                  store type like "Vegan Bakery"
           - rating         (str): Star rating like "4.5", "3.0", or "unknown"
           - reviews        (str): Number of reviews (e.g. "16"), or "" if none
+          - price          (str): "$", "$$", "$$$", or "" if unknown
           - distance_miles (float|null): Miles from the city center
           - latitude       (str): Venue latitude
           - longitude      (str): Venue longitude
           - address        (str): Street address
           - phone          (str): Phone number
           - hours          (str): Opening hours summary
-          - cuisine        (str): Cuisine type(s)
-          - description    (str): Short description of the restaurant
+          - cuisines       (list): Cuisine tags, e.g. ["Asian", "Korean"]
+          - categories     (list): Category tags, e.g. ["Take-out", "Kosher"]
+          - features       (list): e.g. ["Accepts credit cards", "Wi-Fi"]
+          - description    (str): Short description of the venue
 
+        When a [detail] filter hits its scan bound before filling
+        max_results, the array is wrapped as {"results": [...], "note": ...}.
         On error returns: {"error": "<message>"}
     """
     try:
@@ -98,6 +146,10 @@ def search_restaurants(
         hc = HappyCowler(city_url, type_filter=type_filter,
                          max_results=max_results, sort_by=sort_by,
                          min_rating=min_rating, radius_miles=radius_miles,
+                         venue_types=venue_types, cuisines=cuisines,
+                         categories=categories, features=features,
+                         vegan_only=vegan_only, hide_chains=hide_chains,
+                         open_now=open_now, at=at or None,
                          refresh=refresh)
         hc.crawl()
     except Exception as exc:
@@ -114,13 +166,14 @@ def search_restaurants(
     restaurants = []
     for i in range(len(hc.names)):
         tag = _clean(hc.tags[i])
-        if required_tag and required_tag not in tag:
+        if required_tag and tag != required_tag:
             continue
         restaurants.append({
             "name": _clean(hc.names[i]),
             "type": tag,
             "rating": hc.ratings[i],
             "reviews": hc.reviews[i],
+            "price": "$" * hc.prices[i],
             "distance_miles": (round(hc.distances[i], 1)
                                if hc.distances[i] is not None else None),
             "latitude": hc.coordinates[i][0],
@@ -128,12 +181,22 @@ def search_restaurants(
             "address": _clean(hc.addresses[i]),
             "phone": _clean(hc.phone_numbers[i]),
             "hours": _clean(hc.opening_hours[i]),
-            "cuisine": _clean(hc.cuisines[i]),
+            "cuisines": hc.venue_cuisines[i],
+            "categories": hc.venue_categories[i],
+            "features": hc.venue_features[i],
             "description": _clean(hc.descriptions[i]),
         })
         if len(restaurants) >= max_results:
             break
 
+    if hc.scan_truncated:
+        return json.dumps({
+            "results": restaurants,
+            "note": ("Detail-filter scan stopped at its bound before filling "
+                     "max_results; more matches may exist deeper in the "
+                     "listing. Narrow the search (radius/type) or re-run — "
+                     "cached pages make each pass cheaper."),
+        }, ensure_ascii=False, indent=2)
     return json.dumps(restaurants, ensure_ascii=False, indent=2)
 
 

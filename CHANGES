@@ -1,3 +1,22 @@
+Version 0.6.0: 2026-07-09
+  - New: full app-parity sorts — name (A->Z), veg (veg-friendliness), and
+    price_asc/price_desc join distance, rating, and popularity. Prices come
+    from the listing cards' dollar icons (also exposed as a `price` field).
+  - New: full app-parity filters — venue_types (bakery, coffee & tea, juice
+    bar, food truck, stores, spa, ...), cuisines (26 HappyCow cuisines),
+    categories (take-out, gluten-free, organic, pizza, ...), features
+    (outdoor seating, wi-fi, wheelchair, credit cards, reservations),
+    vegan_only ("only show vegan places"), hide_chains (non-veg businesses
+    with 3+ local locations), and open_now / at (parses each venue's hours
+    summary; `at` takes e.g. "Sat 19:30").
+  - New: venue pages' tag pills and feature list are parsed into cuisines,
+    categories, and features output fields; Top Rated flag read from cards.
+  - Detail-dependent filters (cuisines/categories/features/open hours) walk
+    the sorted listing fetching venue pages progressively until max_results
+    match, bounded by detail_scan_limit (80); a truncated scan returns a
+    note alongside the partial results. Venue details cached before 0.6.0
+    lack the new fields and are refetched once on demand.
+
 Version 0.5.0: 2026-07-07
   - New: Local disk cache (default ~/.cache/happycowler, 24h TTL) for city
     listing crawls and venue detail pages. Repeat queries against the same

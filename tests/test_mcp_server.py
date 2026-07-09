@@ -91,11 +91,15 @@ def _make_mock_hc(entries):
     hc.reviews       = [e.get("reviews", "") for e in entries]
     hc.distances     = [e.get("miles")   for e in entries]
     hc.coordinates   = [e.get("coords", ("", "")) for e in entries]
+    hc.prices        = [e.get("price", 0) for e in entries]
+    hc.venue_cuisines   = [e.get("cuisines", []) for e in entries]
+    hc.venue_categories = [e.get("categories", []) for e in entries]
+    hc.venue_features   = [e.get("features", []) for e in entries]
     hc.addresses     = [e["address"]     for e in entries]
     hc.phone_numbers = [e["phone"]       for e in entries]
     hc.opening_hours = [e["hours"]       for e in entries]
-    hc.cuisines      = [e["cuisine"]     for e in entries]
     hc.descriptions  = [e["description"] for e in entries]
+    hc.scan_truncated = False
     return hc
 
 
@@ -122,9 +126,10 @@ class TestMCPSearchRestaurants(unittest.TestCase):
     def test_all_required_fields_present(self, MockHC):
         MockHC.return_value = _make_mock_hc(_SAMPLE_ENTRIES[:1])
         data = json.loads(search_restaurants("https://www.happycow.net/test/"))
-        required = {"name", "type", "rating", "reviews", "distance_miles",
-                    "latitude", "longitude", "address", "phone",
-                    "hours", "cuisine", "description"}
+        required = {"name", "type", "rating", "reviews", "price",
+                    "distance_miles", "latitude", "longitude", "address",
+                    "phone", "hours", "cuisines", "categories", "features",
+                    "description"}
         for field in required:
             self.assertIn(field, data[0], f"Missing field: {field}")
 
@@ -237,6 +242,16 @@ class TestMCPSearchRestaurants(unittest.TestCase):
         MockHC.return_value = _make_mock_hc([])
         data = json.loads(search_restaurants("https://www.happycow.net/test/"))
         self.assertEqual(data, [])
+
+    @patch("happycowler.mcp_server.HappyCowler")
+    def test_truncated_scan_returns_note_wrapper(self, MockHC):
+        hc = _make_mock_hc(_SAMPLE_ENTRIES[:1])
+        hc.scan_truncated = True
+        MockHC.return_value = hc
+        data = json.loads(search_restaurants("https://www.happycow.net/test/"))
+        self.assertIn("results", data)
+        self.assertIn("note", data)
+        self.assertEqual(len(data["results"]), 1)
 
 
 # ---------------------------------------------------------------------------
@@ -353,11 +368,94 @@ class TestCrawlPipelineWithFixtures(unittest.TestCase):
         for d in near.distances:
             self.assertLessEqual(d, 0.2)
 
+    # -- new sorts ------------------------------------------------------------
+
+    def test_sort_by_name_is_alphabetical(self):
+        hc = self._crawl(deep_crawl=False, sort_by="name")
+        lowered = [n.lower() for n in hc.names]
+        self.assertEqual(lowered, sorted(lowered))
+
+    def test_sort_by_veg_ranks_vegan_first(self):
+        hc = self._crawl(deep_crawl=False, sort_by="veg")
+        rank = {"Vegan": 0}
+        ranks = [rank.get(t, 1 if t.startswith("Vegan") else 3)
+                 for t in hc.tags]
+        self.assertEqual(ranks, sorted(ranks))
+        self.assertEqual(hc.names[0], "Noqa Vegan")  # ★5.0 wins the tie
+
+    def test_sort_by_price(self):
+        asc = self._crawl(deep_crawl=False, sort_by="price_asc")
+        known = [p for p in asc.prices if p]
+        self.assertEqual(known, sorted(known))
+        self.assertEqual(asc.prices[-1], 0)  # unknown price sorts last
+        desc = self._crawl(deep_crawl=False, sort_by="price_desc")
+        known_d = [p for p in desc.prices if p]
+        self.assertEqual(known_d, sorted(known_d, reverse=True))
+        self.assertEqual(desc.prices[-1], 0)
+
+    # -- new card-level filters ------------------------------------------------
+
+    def test_venue_types_filter(self):
+        hc = self._crawl(deep_crawl=False, venue_types="veg store")
+        self.assertEqual(hc.names, ["Chocotejas Veganas"])
+
+    def test_vegan_only_filter(self):
+        hc = self._crawl(deep_crawl=False, vegan_only=True)
+        self.assertEqual(len(hc.names), 4)  # drops the Health Store
+        self.assertTrue(all(t.startswith("Vegan") for t in hc.tags))
+
+    def test_chain_detection(self):
+        mk = lambda name, tag: {"name": name, "tag": tag}
+        listings = [mk("Chain Cafe - A", "Veg-friendly"),
+                    mk("Chain Cafe - B", "Veg-friendly"),
+                    mk("Chain Cafe - C", "Veg-friendly"),
+                    mk("Indie Place", "Vegan"),
+                    mk("Vegan Chain - A", "Vegan"),
+                    mk("Vegan Chain - B", "Vegan"),
+                    mk("Vegan Chain - C", "Vegan")]
+        chains = HappyCowler._chain_names(listings)
+        self.assertEqual(chains, {"chaincafe"})  # veg chains are kept
+
+    # -- detail-dependent filters (cuisines/categories/features/hours) ---------
+
+    def test_cuisine_filter_scans_details(self):
+        hc = self._crawl(cuisines="latin", max_results=2)
+        self.assertEqual(len(hc.names), 2)
+        self.assertEqual(hc.venue_cuisines[0], ["Latin"])
+        self.assertFalse(hc.scan_truncated)
+
+    def test_cuisine_filter_no_match(self):
+        hc = self._crawl(cuisines="german")
+        self.assertEqual(hc.names, [])
+
+    def test_category_filter(self):
+        hc = self._crawl(categories="gluten-free", max_results=3)
+        self.assertEqual(len(hc.names), 3)
+        self.assertIn("Gluten-free", hc.venue_categories[0])
+
+    def test_features_filter_requires_all(self):
+        hc = self._crawl(features="wi-fi, credit cards", max_results=2)
+        self.assertEqual(len(hc.names), 2)
+        hc2 = self._crawl(features="sauna")
+        self.assertEqual(hc2.names, [])
+
+    def test_open_at_filter(self):
+        # fixture hours: Mon-Sun 10:00am-6:30pm
+        open_hc = self._crawl(at="Mon 12:30", max_results=3)
+        self.assertEqual(len(open_hc.names), 3)
+        closed_hc = self._crawl(at="Mon 8:00")
+        self.assertEqual(closed_hc.names, [])
+
+    def test_bad_at_value_raises(self):
+        with self.assertRaises(Exception):
+            HappyCowler("https://example.test/", at="whenever")
+
     def test_result_lists_are_equal_length(self):
         hc = self._crawl()
         n = len(hc.names)
         for col in (hc.tags, hc.ratings, hc.addresses, hc.phone_numbers,
-                    hc.opening_hours, hc.cuisines, hc.descriptions,
+                    hc.opening_hours, hc.venue_cuisines, hc.venue_categories,
+                    hc.venue_features, hc.prices, hc.descriptions,
                     hc.coordinates):
             self.assertEqual(len(col), n)
 
@@ -489,9 +587,10 @@ class TestLiveHappyCow(unittest.TestCase):
                            "Expected at least one restaurant for Worms, Germany")
 
     def test_all_required_fields_present(self):
-        required = {"name", "type", "rating", "reviews", "distance_miles",
-                    "latitude", "longitude", "address",
-                    "phone", "hours", "cuisine", "description"}
+        required = {"name", "type", "rating", "reviews", "price",
+                    "distance_miles", "latitude", "longitude", "address",
+                    "phone", "hours", "cuisines", "categories", "features",
+                    "description"}
         for r in self._fetch(max_results=5):
             missing = required - set(r.keys())
             self.assertEqual(missing, set(), f"Restaurant missing fields: {missing}")
