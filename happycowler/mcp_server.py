@@ -46,7 +46,8 @@ def search_restaurants(
         Lima, Peru        -> https://www.happycow.net/south_america/peru/lima/
         Tokyo, Japan      -> https://www.happycow.net/asia/japan/tokyo/
         Berlin, Germany   -> https://www.happycow.net/europe/germany/berlin/
-        New York, USA     -> https://www.happycow.net/north_america/usa/new-york/
+        New York City     -> https://www.happycow.net/north_america/usa/new_york/new_york_city/
+                             (US cities nest under their state; underscores throughout)
         London, UK        -> https://www.happycow.net/europe/england/london/
         Sydney, Australia -> https://www.happycow.net/oceania/australia/sydney/
         Bangkok, Thailand -> https://www.happycow.net/asia/thailand/bangkok/
