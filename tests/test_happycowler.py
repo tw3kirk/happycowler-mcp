@@ -6,8 +6,10 @@ from unittest.mock import patch
 from happycowler import happycowler as hc_mod
 from happycowler.happycowler import (
     HappyCowler,
+    city_query_from_url,
     classify_type,
     extract_latlng,
+    resolve_latlng,
     is_open_at,
     parse_hours,
     parse_listing_fragment,
@@ -73,6 +75,57 @@ class LatLngExtraction(unittest.TestCase):
                              ("39.8", "-105.0")]
         )
         self.assertEqual(extract_latlng(html), ("39.8", "-105.0"))
+
+
+class CityQueryFromUrl(unittest.TestCase):
+
+    def test_us_city_drops_continent_and_uppercases_usa(self):
+        self.assertEqual(
+            city_query_from_url(
+                "https://www.happycow.net/north_america/usa/colorado/"
+                "pagosa_springs/"),
+            "Pagosa Springs, Colorado, USA")
+
+    def test_non_us_city_has_no_state_segment(self):
+        self.assertEqual(
+            city_query_from_url("https://www.happycow.net/south_america/peru/"
+                                "lima/"),
+            "Lima, Peru")
+
+    def test_hyphenated_slug(self):
+        self.assertEqual(
+            city_query_from_url("https://www.happycow.net/north_america/"
+                                "mexico/mexico-city/"),
+            "Mexico City, Mexico")
+
+    def test_empty_path_raises(self):
+        with self.assertRaises(HappyCowError):
+            city_query_from_url("https://www.happycow.net/")
+
+
+class ResolveLatLng(unittest.TestCase):
+    """Small-town pages carry no coordinates at all, so they must fall back
+    to geocoding rather than failing the whole search."""
+
+    def test_prefers_scraped_coordinates_without_geocoding(self):
+        html = '<a href="/searchmap?lat=39.8&amp;lng=-105.0">map</a>'
+        with patch.object(hc_mod, "geocode_city") as geocode:
+            self.assertEqual(
+                resolve_latlng("https://www.happycow.net/na/usa/co/denver/",
+                               html),
+                ("39.8", "-105.0"))
+        geocode.assert_not_called()
+
+    def test_falls_back_to_geocoding_when_page_has_none(self):
+        with patch.object(hc_mod, "geocode_city",
+                          return_value=("37.2695", "-107.0108")) as geocode:
+            self.assertEqual(
+                resolve_latlng(
+                    "https://www.happycow.net/north_america/usa/colorado/"
+                    "pagosa_springs/",
+                    "<html>no coordinates here</html>"),
+                ("37.2695", "-107.0108"))
+        self.assertEqual(geocode.call_count, 1)
 
 
 class ListingFragmentParser(unittest.TestCase):

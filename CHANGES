@@ -1,3 +1,19 @@
+Version 0.6.1: 2026-09-27
+  - Fix: small towns returned "Could not find map coordinates on the city
+    page" and no results at all. Big-city pages ship a nearby-cities sidebar
+    of /searchmap?lat=..&lng=.. links to seed the map from; small-town pages
+    ship no sidebar, no venue cards and no coordinates of any kind (the whole
+    listing renders client side), so there was nothing to scrape. Confirmed
+    on Pagosa Springs, Durango and Cortez CO — all three returned 0 of the
+    ~12 venues HappyCow actually lists.
+  - New: geocoding fallback. When a page has no coordinates, the city is
+    geocoded from its own URL slug via Nominatim (keyless; identifying
+    User-Agent and the existing 1 req/sec throttle honour their terms).
+    Results are cached for a year — towns don't move.
+  - Scraped coordinates are still preferred when present, so big cities are
+    unchanged and cost no extra request.
+  - `_cache_read` takes an optional `ttl` so entry kinds can age differently.
+
 Version 0.6.0: 2026-07-09
   - New: full app-parity sorts — name (A->Z), veg (veg-friendliness), and
     price_asc/price_desc join distance, rating, and popularity. Prices come

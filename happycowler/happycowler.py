@@ -57,6 +57,19 @@ DEFAULT_USER_AGENT = (
 # Ampersands may be HTML-escaped (``&amp;``) in the served markup.
 _LATLNG_RE = re.compile(r"lat=(-?\d+(?:\.\d+)?)&(?:amp;)?lng=(-?\d+(?:\.\d+)?)")
 
+# Small-town city pages carry no nearby-cities sidebar, no venue cards and no
+# coordinates of any kind, so there is nothing to scrape a map seed from.
+# Geocoding the city out of its own URL slug covers those. Nominatim needs no
+# API key; its terms ask for a identifying User-Agent and <=1 request/second,
+# both of which we honour (see _throttle).
+NOMINATIM_ENDPOINT = "https://nominatim.openstreetmap.org/search"
+_GEOCODE_UA = "happycowler-mcp (https://github.com/peterwittek/happycowler)"
+_GEOCODE_TTL = float(
+    os.environ.get("HAPPYCOW_GEOCODE_TTL", str(365 * 24 * 3600)))
+
+# Slugs that read wrong when title-cased ("Usa" -> "USA").
+_SLUG_UPPER = {"usa", "uk", "uae"}
+
 # HappyCow's data-type / category-label values that map onto the classic
 # Vegan / Vegetarian / Veg-friendly buckets the MCP type_filter understands.
 _RESTAURANT_TYPE = {
@@ -108,15 +121,16 @@ def _cache_path(kind, key):
     return os.path.join(_CACHE_DIR, "{}-{}.json".format(kind, digest))
 
 
-def _cache_read(kind, key):
+def _cache_read(kind, key, ttl=None):
     if _CACHE_TTL <= 0:
         return None
+    max_age = _CACHE_TTL if ttl is None else ttl
     try:
         with open(_cache_path(kind, key)) as f:
             entry = json.load(f)
     except (OSError, ValueError):
         return None
-    if time.time() - entry.get("fetched_at", 0) > _CACHE_TTL:
+    if time.time() - entry.get("fetched_at", 0) > max_age:
         return None
     return entry.get("data")
 
@@ -205,6 +219,84 @@ def extract_latlng(city_html):
     lngs = sorted(float(lng) for _, lng in matches)
     mid = len(matches) // 2
     return repr(lats[mid]), repr(lngs[mid])
+
+
+def city_query_from_url(city_url):
+    """Turn a HappyCow city URL into a geocodable place name.
+
+    ``/north_america/usa/colorado/pagosa_springs/`` -> ``Pagosa Springs,
+    Colorado, USA``. The leading continent segment is HappyCow's own taxonomy
+    rather than a place, so it is dropped; the rest is reversed so the most
+    specific component leads, which is what geocoders expect.
+    """
+    path = re.sub(r"^https?://[^/]+", "", city_url).strip("/")
+    parts = [p for p in path.split("/") if p]
+    if len(parts) > 1:
+        parts = parts[1:]  # drop the continent slug
+    if not parts:
+        raise HappyCowError(
+            "Cannot derive a place name from {!r}; expected a URL like "
+            "https://www.happycow.net/north_america/usa/colorado/denver/"
+            .format(city_url)
+        )
+    names = []
+    for part in reversed(parts):
+        words = part.replace("_", " ").replace("-", " ").strip()
+        names.append(words.upper() if words.lower() in _SLUG_UPPER
+                     else words.title())
+    return ", ".join(names)
+
+
+def geocode_city(city_url, session=None):
+    """Resolve a city URL to (lat, lng) via Nominatim.
+
+    Used when the city page carries no coordinates of its own. Results are
+    cached for a year — a town's location does not move, and this keeps the
+    load on a free, community-run service to essentially nothing.
+    """
+    query = city_query_from_url(city_url)
+    cached = _cache_read("geocode", query, ttl=_GEOCODE_TTL)
+    if cached:
+        return tuple(cached)
+    session = session or _new_session()
+    _throttle()
+    try:
+        response = session.get(
+            NOMINATIM_ENDPOINT,
+            params={"q": query, "format": "json", "limit": 1},
+            headers={"User-Agent": _GEOCODE_UA},
+            timeout=30,
+        )
+        response.raise_for_status()
+        results = response.json()
+    except (RequestException, ValueError) as exc:
+        raise HappyCowError(
+            "The city page for {} carries no map coordinates, and the "
+            "geocoding fallback for {!r} failed: {}".format(city_url, query, exc)
+        )
+    if not results:
+        raise HappyCowError(
+            "The city page for {} carries no map coordinates, and {!r} could "
+            "not be geocoded. Check the city URL is a real HappyCow listing."
+            .format(city_url, query)
+        )
+    lat, lng = str(results[0]["lat"]), str(results[0]["lon"])
+    _cache_write("geocode", query, [lat, lng])
+    return lat, lng
+
+
+def resolve_latlng(city_url, city_html, session=None):
+    """Map seed for a city, however we can get it.
+
+    Big-city pages ship a nearby-cities sidebar we can scrape (HappyCow's own
+    numbers, no extra request). Small-town pages ship no sidebar, no venue
+    cards and no coordinates at all — the listing is rendered entirely client
+    side — so those fall back to geocoding the slug.
+    """
+    try:
+        return extract_latlng(city_html)
+    except HappyCowError:
+        return geocode_city(city_url, session=session)
 
 
 def classify_type(data_type, vegan="0", vegonly="0"):
@@ -634,7 +726,7 @@ class HappyCowler(object):
                 return [dict(v, coordinates=tuple(v["coordinates"]))
                         for v in cached]
         city_html = _http_get(self.session, city_url)
-        lat, lng = extract_latlng(city_html)
+        lat, lng = resolve_latlng(city_url, city_html, session=self.session)
         collected, seen = [], set()
         for page in range(1, self.max_pages + 1):
             url = "{}?lat={}&lng={}&page={}&s=3".format(
